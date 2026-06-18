@@ -1,0 +1,31 @@
+# Секреты и локальная сессия
+.env
+.env.*
+!.env.example
+.cookies*
+cookies.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# CRM-выгрузки и документы
+bitrix24_company_contexts/
+raw/
+documents/
+metadata/
+*.html
+*.htm
+
+# macOS и редакторы
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
