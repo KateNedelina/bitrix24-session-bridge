@@ -166,10 +166,15 @@ def normalize_base_url(url: str) -> str:
 
 def to_absolute(base_url: str, url_or_path: str) -> str:
     if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
-        return url_or_path
-    if not url_or_path.startswith("/"):
-        url_or_path = "/" + url_or_path
-    return base_url + url_or_path
+        candidate = url_or_path
+    else:
+        candidate = url_or_path if url_or_path.startswith("/") else "/" + url_or_path
+        candidate = base_url + candidate
+    parsed = urllib.parse.urlsplit(candidate)
+    # Bitrix can expose a human-readable shared-disk path in inline scripts.
+    # urllib.request requires its path to be percent-encoded on the wire.
+    path = urllib.parse.quote(parsed.path, safe="/%:@!$&'()*+,;=-._~")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
 
 
 def clean_text(raw_html: str) -> str:
@@ -1226,7 +1231,9 @@ def guess_extension(content: bytes, fallback: str = ".bin") -> str:
     if content.startswith(b"%PDF"):
         return ".pdf"
     if content.startswith(b"PK\x03\x04"):
-        return ".docx"
+        # OOXML, XLSX, PPTX and ordinary ZIP archives share this signature.
+        # Do not mislabel an unknown ZIP as a Word document.
+        return ".zip"
     if content.startswith(b"\xd0\xcf\x11\xe0"):
         return ".doc"
     return fallback
@@ -1323,12 +1330,16 @@ def disk_entry_mime(name: str) -> str | None:
 
 
 def extract_shared_disk_child_folders(raw_html: str, current_url: str) -> list[dict[str, str]]:
-    """Find only explicit shared-disk folder URLs from one opened folder page."""
+    """Find child folder tiles, never shared-disk breadcrumb ancestors."""
     current = urllib.parse.urlsplit(current_url)
     discovered: list[dict[str, str]] = []
     seen: set[str] = set()
-    for raw_link in extract_shared_disk_folder_links(raw_html):
-        candidate = urllib.parse.urljoin(current_url, raw_link)
+    entry_re = re.compile(
+        r'"id":"(?P<id>\d+)","name":"(?P<name>[^"]+)","isFolder":true.*?"link":"(?P<link>[^"]+)"',
+        re.S,
+    )
+    for match in entry_re.finditer(raw_html):
+        candidate = urllib.parse.urljoin(current_url, js_unescape(match.group("link")))
         parsed = urllib.parse.urlsplit(candidate)
         if parsed.scheme and parsed.netloc and (parsed.scheme, parsed.netloc) != (current.scheme, current.netloc):
             continue
@@ -1337,7 +1348,7 @@ def extract_shared_disk_child_folders(raw_html: str, current_url: str) -> list[d
         if canonical == current_canonical or canonical in seen:
             continue
         seen.add(canonical)
-        name = urllib.parse.unquote(parsed.path.rstrip("/").split("/")[-1]) or "folder"
+        name = js_unescape(match.group("name")) or urllib.parse.unquote(parsed.path.rstrip("/").split("/")[-1]) or "folder"
         discovered.append({"name": name, "url": canonical + "/"})
     return discovered
 

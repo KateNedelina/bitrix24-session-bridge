@@ -85,7 +85,8 @@ class FolderClient(FakeClient):
         return (
             self.base_url + "/docs/shared/path/root/",
             '"id":"1","name":"proof.png","isFolder":false,"href":"\\/disk\\/downloadFile\\/1\\/?filename=proof.png" '
-            '<a href="/docs/shared/path/root/child-folder/">child-folder</a>',
+            '"id":"7","name":"child-folder","isFolder":true,"link":"\\/docs\\/shared\\/path\\/root\\/child-folder/" '
+            '<a href="/docs/shared/path/">shared-disk breadcrumb</a>',
         )
 
     def fetch_binary(self, target):
@@ -187,6 +188,13 @@ class CollectDealContextTests(unittest.TestCase):
             self.assertEqual(proof["download_status"], "DOWNLOADED")
             self.assertTrue(proof["sha256"])
             self.assertEqual(next(item for item in inventory["files"] if item["name"] == "notes.txt")["download_status"], "NOT_REQUESTED")
+
+    def test_transport_url_encodes_human_readable_disk_path(self):
+        url = bridge.to_absolute("https://crm.example.test", "/docs/shared/path/Папка/файл")
+        self.assertEqual(url, "https://crm.example.test/docs/shared/path/%D0%9F%D0%B0%D0%BF%D0%BA%D0%B0/%D1%84%D0%B0%D0%B9%D0%BB")
+
+    def test_unknown_zip_is_not_mislabeled_as_docx(self):
+        self.assertEqual(bridge.guess_extension(b"PK\x03\x04"), ".zip")
 
     def test_existing_commands_remain_registered(self):
         parser = bridge.build_parser()
