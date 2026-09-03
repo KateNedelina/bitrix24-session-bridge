@@ -16,6 +16,7 @@ import http.client
 import http.cookiejar
 import hashlib
 import json
+import mimetypes
 import os
 import pathlib
 import re
@@ -33,15 +34,19 @@ from typing import Iterable
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parents[1]
 ENV_PATH = SKILL_DIR / ".env"
-BRIDGE_VERSION = "0.2.0-dev"
-BRIDGE_CONTRACT_VERSION = "1.0"
+BRIDGE_VERSION = "0.3.0-candidate"
+BRIDGE_CONTRACT_VERSION = "1.1"
 BRIDGE_CAPABILITIES = (
     "deal_outer_and_side_slider_fetch",
     "exact_deal_model_selection",
     "empty_registered_fields",
     "field_schema_export",
     "generic_exact_entity_collection",
+    "contact_and_company_entity_collection",
     "linked_entity_references",
+    "standard_field_schema",
+    "reference_display_value_resolution",
+    "project_folder_inventory",
     "read_only_collection",
 )
 COLLECT_MODES = ("quick", "package", "full", "deep")
@@ -79,6 +84,31 @@ CRM_ENTITY_TYPES = {
     "4": "company",
     "7": "quote",
     "31": "smart_invoice",
+}
+
+# Standard fields are part of the stable Bitrix CRM model even where the card's
+# embedded editor config exposes only user fields.  Keeping this map generic
+# lets a consumer prove the code/title/type of a standard field instead of
+# treating a missing editor fragment as a value-type inference.  A title read
+# from the actual page always overrides this fallback metadata.
+STANDARD_FIELD_SCHEMA: dict[str, dict[str, object]] = {
+    "ID": {"field_title": "ID", "field_type": "integer", "multiple": False},
+    "TITLE": {"field_title": "Название", "field_type": "string", "multiple": False},
+    "ASSIGNED_BY_ID": {"field_title": "Ответственный", "field_type": "user", "multiple": False},
+    "ASSIGNED_BY_FORMATTED_NAME": {"field_title": "Ответственный", "field_type": "string", "multiple": False},
+    "COMPANY_ID": {"field_title": "Компания", "field_type": "crm_reference", "multiple": False},
+    "CONTACT_ID": {"field_title": "Контакт", "field_type": "crm_reference", "multiple": False},
+    "CONTACT_IDS": {"field_title": "Контакты", "field_type": "crm_reference", "multiple": True},
+    "COMPANY_TITLE": {"field_title": "Компания", "field_type": "string", "multiple": False},
+    "CONTACT_FULL_NAME": {"field_title": "Контакт", "field_type": "string", "multiple": False},
+    "LAST_NAME": {"field_title": "Фамилия", "field_type": "string", "multiple": False},
+    "NAME": {"field_title": "Имя", "field_type": "string", "multiple": False},
+    "SECOND_NAME": {"field_title": "Отчество", "field_type": "string", "multiple": False},
+    "POST": {"field_title": "Должность", "field_type": "string", "multiple": False},
+    "EMAIL": {"field_title": "E-mail", "field_type": "multifield", "multiple": True},
+    "PHONE": {"field_title": "Телефон", "field_type": "multifield", "multiple": True},
+    "DATE_CREATE": {"field_title": "Дата создания", "field_type": "datetime", "multiple": False},
+    "DATE_MODIFY": {"field_title": "Дата изменения", "field_type": "datetime", "multiple": False},
 }
 COMPANY_TAB_COLLECT_DENYLIST = {
     "crm_rest_marketplace",
@@ -633,6 +663,19 @@ def normalize_crm_path(raw_url: str) -> str:
 
 def classify_entity_path(path: str) -> dict[str, str] | None:
     path = normalize_crm_path(path)
+    standard_match = re.search(r"/crm/(?P<kind>contact|company)/details/(?P<id>\d+)/", path)
+    if standard_match:
+        kind = standard_match.group("kind")
+        item_id = standard_match.group("id")
+        if item_id == "0":
+            return None
+        entity_type_id = "3" if kind == "contact" else "4"
+        return {
+            "kind": kind,
+            "entity_type_id": entity_type_id,
+            "id": item_id,
+            "url": f"/crm/{kind}/details/{item_id}/",
+        }
     deal_match = re.search(r"/crm/deal/details/(?P<id>\d+)/", path)
     if deal_match:
         deal_id = deal_match.group("id")
@@ -795,22 +838,33 @@ def infer_field_type(value: object) -> tuple[str, bool]:
 
 
 def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[str, dict[str, object]]:
-    """Extract schema fragments without inventing titles that the page did not expose.
+    """Extract complete, evidence-bearing schema fragments from one card.
 
     Bitrix installations serialize field configuration in several slightly
     different JavaScript shapes.  This parser intentionally accepts only an
     explicit field code followed by an object; unobserved metadata remains null.
     """
     schema: dict[str, dict[str, object]] = {}
-    for code, value in raw_fields.items():
+
+    def ensure_record(code: str, value: object | None = None) -> dict[str, object]:
+        existing = schema.get(code)
+        if existing is not None:
+            return existing
         inferred_type, inferred_multiple = infer_field_type(value)
-        schema[code] = {
+        standard = STANDARD_FIELD_SCHEMA.get(code)
+        record: dict[str, object] = {
             "field_code": code,
-            "field_title": None,
-            "field_type": inferred_type,
-            "multiple": inferred_multiple,
-            "metadata_source": "VALUE_TYPE_INFERENCE",
+            "field_title": standard.get("field_title") if standard else None,
+            "field_type": standard.get("field_type") if standard else inferred_type,
+            "multiple": standard.get("multiple") if standard else inferred_multiple,
+            "settings": {},
+            "metadata_source": "STANDARD_BITRIX_FIELD_SCHEMA" if standard else "VALUE_TYPE_INFERENCE",
         }
+        schema[code] = record
+        return record
+
+    for code, value in raw_fields.items():
+        ensure_record(code, value)
 
     def balanced_array(start: int) -> str | None:
         depth = 0
@@ -838,7 +892,7 @@ def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[s
 
     def walk(value: object) -> Iterable[dict[str, object]]:
         if isinstance(value, dict):
-            if value.get("name") in raw_fields and isinstance(value.get("data"), dict):
+            if isinstance(value.get("name"), str) and isinstance(value.get("data"), dict):
                 yield value
             for child in value.values():
                 yield from walk(child)
@@ -862,7 +916,7 @@ def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[s
             continue
         for definition in walk(current_config):
             code = str(definition.get("name"))
-            record = schema[code]
+            record = ensure_record(code, raw_fields.get(code))
             data = definition.get("data") if isinstance(definition.get("data"), dict) else {}
             info = data.get("fieldInfo") if isinstance(data.get("fieldInfo"), dict) else {}
             record["field_title"] = str(definition.get("title") or "").strip() or record.get("field_title")
@@ -870,12 +924,14 @@ def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[s
             multiple = info.get("MULTIPLE")
             if multiple is not None:
                 record["multiple"] = str(multiple).upper() in {"Y", "TRUE", "1"}
-            enum_rows = info.get("ENUM")
+            record["settings"] = dict(info)
+            enum_rows = info.get("ENUM") or info.get("ITEMS") or info.get("OPTIONS")
             if isinstance(enum_rows, list):
                 options = {str(item.get("ID")): str(item.get("VALUE") or "") for item in enum_rows
                            if isinstance(item, dict) and item.get("ID") is not None}
                 if options:
                     record["enumeration_options"] = options
+                    record["display_options"] = options
                     record["option_list_version"] = "sha256:" + hashlib.sha256(
                         json.dumps(options, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     ).hexdigest()
@@ -884,8 +940,6 @@ def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[s
     code_pattern = re.compile(r"(?P<quote>['\"])(?P<code>[A-Z][A-Z0-9_]+)(?P=quote)\s*:\s*\{")
     for match in code_pattern.finditer(raw_html):
         code = match.group("code")
-        if code not in raw_fields:
-            continue
         extracted = extract_balanced_object(raw_html, match.end() - 1)
         if not extracted:
             continue
@@ -916,7 +970,7 @@ def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[s
             fragment,
             re.I,
         )
-        record = schema[code]
+        record = ensure_record(code, raw_fields.get(code))
         if title:
             record["field_title"] = title
         if field_type:
@@ -935,6 +989,7 @@ def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[s
             options = {str(key): str(value) for key, value in option_source.items()}
         if options:
             record["enumeration_options"] = options
+            record["display_options"] = options
             record["option_list_version"] = "sha256:" + hashlib.sha256(
                 json.dumps(options, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
@@ -960,6 +1015,84 @@ def value_from_signed_field(value: object) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def display_value_from_field(value: object, schema: dict[str, object]) -> str:
+    """Resolve a human display value without replacing the preserved raw value.
+
+    Bitrix may serialize a reference as a signed ``VALUE`` only, as a compound
+    object with a label, or with a list embedded in the field definition.  This
+    resolution is deliberately generic: it uses only data carried by the card
+    and never assumes a particular iblock, element ID, or pilot value.
+    """
+    if isinstance(value, list):
+        values = [display_value_from_field(item, schema) for item in value]
+        return ", ".join(item for item in values if item)
+    if isinstance(value, dict):
+        for key in ("DISPLAY_VALUE", "VALUE_NAME", "TITLE", "NAME", "TEXT", "CAPTION"):
+            direct = value.get(key)
+            if isinstance(direct, (str, int, float)) and str(direct).strip():
+                return str(direct).strip()
+        raw_value = value.get("VALUE")
+    else:
+        raw_value = value
+    if isinstance(raw_value, list):
+        return display_value_from_field(raw_value, schema)
+    raw_text = value_from_signed_field(raw_value)
+    options = schema.get("display_options") or schema.get("enumeration_options")
+    if isinstance(options, dict) and raw_text in options:
+        return str(options[raw_text])
+    return raw_text
+
+
+def normalized_field_value(value: object, schema: dict[str, object]) -> str:
+    """Keep enum IDs for enum normalizers, but use labels for iblock references."""
+    field_type = str(schema.get("field_type") or "").casefold()
+    if field_type in {"iblock_element", "iblock_section"}:
+        return display_value_from_field(value, schema)
+    return value_from_signed_field(value)
+
+
+def build_field_records(
+    schema: dict[str, dict[str, object]],
+    raw_fields: dict[str, object],
+    *,
+    entity_type: str,
+    entity_type_id: str,
+    entity_id: str,
+    source_url: str,
+    read_at: str,
+    retrieval_method: str,
+) -> list[dict[str, object]]:
+    """Emit every registered field, including editor-declared empty fields."""
+    records: list[dict[str, object]] = []
+    for code in sorted(schema):
+        definition = schema[code]
+        raw_value = raw_fields.get(code)
+        normalized = normalized_field_value(raw_value, definition)
+        records.append({
+            "field_code": code,
+            "field_name": code,
+            "field_title": definition.get("field_title"),
+            "field_type": definition.get("field_type"),
+            "multiple": definition.get("multiple"),
+            "settings": definition.get("settings") or {},
+            "enumeration_options": definition.get("enumeration_options"),
+            "display_options": definition.get("display_options"),
+            "option_list_version": definition.get("option_list_version"),
+            "raw_value": raw_value,
+            "normalized_value": normalized,
+            "display_value": display_value_from_field(raw_value, definition),
+            "entity_type": entity_type,
+            "entity_type_id": entity_type_id,
+            "entity_id": entity_id,
+            "source_url": source_url,
+            "read_at": read_at,
+            "retrieval_method": retrieval_method,
+            "availability": "PASS" if normalized else "FIELD_EMPTY",
+            "schema_metadata_source": definition.get("metadata_source"),
+        })
+    return records
 
 
 def enrich_deal_from_detail_data(deal: dict[str, str], data: dict[str, object]) -> None:
@@ -1172,6 +1305,59 @@ def extract_disk_downloads(raw_html: str) -> list[dict[str, str]]:
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+def is_probable_html(content: bytes) -> bool:
+    prefix = content.lstrip()[:512].lower()
+    return prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html") or b"name=\"form_auth\"" in prefix
+
+
+def disk_entry_extension(name: str) -> str | None:
+    suffix = pathlib.Path(name).suffix.lower()
+    return suffix or None
+
+
+def disk_entry_mime(name: str) -> str | None:
+    mime, _ = mimetypes.guess_type(name)
+    return mime
+
+
+def extract_shared_disk_child_folders(raw_html: str, current_url: str) -> list[dict[str, str]]:
+    """Find only explicit shared-disk folder URLs from one opened folder page."""
+    current = urllib.parse.urlsplit(current_url)
+    discovered: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_link in extract_shared_disk_folder_links(raw_html):
+        candidate = urllib.parse.urljoin(current_url, raw_link)
+        parsed = urllib.parse.urlsplit(candidate)
+        if parsed.scheme and parsed.netloc and (parsed.scheme, parsed.netloc) != (current.scheme, current.netloc):
+            continue
+        canonical = urllib.parse.urlunsplit((current.scheme, current.netloc, parsed.path.rstrip("/"), "", ""))
+        current_canonical = urllib.parse.urlunsplit((current.scheme, current.netloc, current.path.rstrip("/"), "", ""))
+        if canonical == current_canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        name = urllib.parse.unquote(parsed.path.rstrip("/").split("/")[-1]) or "folder"
+        discovered.append({"name": name, "url": canonical + "/"})
+    return discovered
+
+
+def extract_disk_pagination_links(raw_html: str, current_url: str) -> list[str]:
+    """Return explicitly linked page variants; do not invent component routes."""
+    current = urllib.parse.urlsplit(current_url)
+    links: list[str] = []
+    for raw_link in re.findall(r'href=["\']([^"\']+)["\']', raw_html, re.I):
+        candidate = urllib.parse.urljoin(current_url, html.unescape(raw_link))
+        parsed = urllib.parse.urlsplit(candidate)
+        if (parsed.scheme, parsed.netloc, parsed.path.rstrip("/")) != (current.scheme, current.netloc, current.path.rstrip("/")):
+            continue
+        query = urllib.parse.parse_qs(parsed.query)
+        if not any(key.casefold() in {"page", "pagen_1", "pagen_2"} for key in query):
+            continue
+        canonical = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
+        if canonical not in links:
+            links.append(canonical)
+    return links
 
 
 def extract_tab_loaders(raw_html: str) -> list[dict[str, object]]:
@@ -1529,6 +1715,7 @@ def command_contract(output: str | None) -> int:
         "commands": [
             "collect-deal-context",
             "collect-entity-context",
+            "collect-project-folder",
             "collect-company-context",
             "list-income-contracts",
         ],
@@ -1579,6 +1766,11 @@ def command_collect_entity_context(
     expected_id = str(ref["id"])
     attempts: list[dict[str, object]] = []
 
+    # Unlike the deal collector, this command used to fetch a card before a
+    # session existed.  That returned an auth shell for contacts/companies and
+    # made an exact entity look absent.  Login is a read-only prerequisite.
+    client.login_portal()
+
     def exact(page_html: str) -> list[dict[str, object]]:
         return [
             item for item in extract_entity_data_objects(page_html)
@@ -1607,25 +1799,12 @@ def command_collect_entity_context(
         raw_fields = dict(matches[0]["data"])
     schema = extract_field_schema(raw_html, raw_fields)
     read_at = now_iso()
-    fields = [{
-        "field_code": code,
-        "field_name": code,
-        "field_title": schema[code].get("field_title"),
-        "field_type": schema[code].get("field_type"),
-        "multiple": schema[code].get("multiple"),
-        "enumeration_options": schema[code].get("enumeration_options"),
-        "option_list_version": schema[code].get("option_list_version"),
-        "raw_value": value,
-        "normalized_value": value_from_signed_field(value),
-        "entity_type": ref["kind"],
-        "entity_type_id": expected_type_id,
-        "entity_id": expected_id,
-        "source_url": final_url,
-        "read_at": read_at,
-        "retrieval_method": "AUTHENTICATED_ENTITY_CARD_EMBEDDED_MODEL",
-        "availability": "PASS" if value_from_signed_field(value) else "FIELD_EMPTY",
-        "schema_metadata_source": schema[code].get("metadata_source"),
-    } for code, value in sorted(raw_fields.items())]
+    fields = build_field_records(
+        schema, raw_fields,
+        entity_type=str(ref["kind"]), entity_type_id=expected_type_id,
+        entity_id=expected_id, source_url=final_url, read_at=read_at,
+        retrieval_method="AUTHENTICATED_ENTITY_CARD_EMBEDDED_MODEL",
+    )
     entity = {
         "schema_version": "1.0",
         "entity_type": ref["kind"],
@@ -1636,9 +1815,15 @@ def command_collect_entity_context(
         "raw_html_sha256": hashlib.sha256(raw_html.encode("utf-8")).hexdigest(),
         "fetch_attempts": attempts,
     }
+    related_entities = extract_entity_refs(raw_html, source="ENTITY_CARD_EMBEDDED_RELATION")
+    for related in related_entities:
+        related["source_entity_type"] = ref["kind"]
+        related["source_entity_type_id"] = expected_type_id
+        related["source_entity_id"] = expected_id
     write_text_file(meta_dir / "entity.json", json.dumps(entity, ensure_ascii=False, indent=2) + "\n")
     write_text_file(meta_dir / "fields.json", json.dumps(fields, ensure_ascii=False, indent=2) + "\n")
     write_text_file(meta_dir / "field_schema.json", json.dumps(list(schema.values()), ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "related_entities.json", json.dumps(related_entities, ensure_ascii=False, indent=2) + "\n")
     status = "ok" if fields and not errors else "blocked"
     report = {
         "schema_version": "1.0",
@@ -1647,7 +1832,7 @@ def command_collect_entity_context(
         "bridge_version": BRIDGE_VERSION,
         "bridge_contract_version": BRIDGE_CONTRACT_VERSION,
         "selected_entity": entity,
-        "counts": {"fields": len(fields), "field_schema": len(schema)},
+        "counts": {"fields": len(fields), "field_schema": len(schema), "related_entities": len(related_entities)},
         "fetch_attempts": attempts,
         "errors": errors,
         "started_at": started_at,
@@ -1656,6 +1841,178 @@ def command_collect_entity_context(
     write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(str(meta_dir / "run_report.json"))
     return 0 if status == "ok" else 2
+
+
+def command_collect_project_folder(
+    client: BitrixSessionClient,
+    output_dir: str,
+    folder_url: str,
+    download_file_urls: list[str],
+    max_pages: int,
+) -> int:
+    """Inventory one exact Bitrix Disk project folder through the logged-in session.
+
+    The command intentionally has no business rule for selecting a document.
+    It inventories all navigable pages and nested shared folders, then downloads
+    only file URLs explicitly requested by the caller and found in that exact
+    inventory.  Every network operation remains GET/read-only.
+    """
+    root = pathlib.Path(output_dir).expanduser().resolve()
+    raw_dir = ensure_dir(root / "raw")
+    downloads_dir = ensure_dir(root / "downloads")
+    started_at = now_iso()
+    errors: list[str] = []
+    warnings: list[str] = []
+    parsed_root = urllib.parse.urlsplit(folder_url)
+    if not parsed_root.scheme or not parsed_root.netloc or "/docs/shared/path/" not in parsed_root.path:
+        errors.append("PROJECT_FOLDER_URL_INVALID")
+    if errors:
+        report = {
+            "schema_version": "1.0", "operation": "COLLECT_PROJECT_FOLDER", "status": "blocked",
+            "started_at": started_at, "finished_at": now_iso(), "errors": errors, "warnings": warnings,
+        }
+        write_text_file(root / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        return 2
+
+    client.login_portal()
+    queue: list[tuple[str, str, str | None]] = [(folder_url, "", None)]
+    visited: set[str] = set()
+    page_count = 0
+    folders: list[dict[str, object]] = []
+    files: list[dict[str, object]] = []
+    raw_pages: list[dict[str, object]] = []
+    known_downloads: dict[str, dict[str, object]] = {}
+
+    while queue and page_count < max_pages:
+        target, parent_path, parent_id = queue.pop(0)
+        parsed = urllib.parse.urlsplit(target)
+        canonical = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/", parsed.query, ""))
+        if canonical in visited:
+            continue
+        visited.add(canonical)
+        try:
+            final_url, page_html = client.fetch(target)
+        except Exception as exc:
+            errors.append(f"PROJECT_FOLDER_FETCH_FAILED:{type(exc).__name__}")
+            continue
+        page_count += 1
+        raw_name = f"folder-page-{page_count:03d}.html"
+        write_text_file(raw_dir / raw_name, page_html)
+        raw_pages.append({"url": final_url, "raw_file": str(pathlib.Path("raw") / raw_name), "read_at": now_iso()})
+        if 'name="form_auth"' in page_html:
+            errors.append("PROJECT_FOLDER_AUTH_HTML")
+            continue
+        if re.search(r"(?:access denied|доступ запрещен|нет прав)", clean_text(page_html), re.I):
+            errors.append("PROJECT_FOLDER_ACCESS_DENIED")
+            continue
+
+        folder_name = urllib.parse.unquote(urllib.parse.urlsplit(final_url).path.rstrip("/").split("/")[-1]) or "project-folder"
+        folders.append({
+            "object_id": parent_id,
+            "folder_id": parent_id,
+            "path": parent_path or folder_name,
+            "name": folder_name,
+            "kind": "folder",
+            "source_url": final_url,
+            "read_at": raw_pages[-1]["read_at"],
+            "retrieval_method": "AUTHENTICATED_BITRIX_DISK_FOLDER_PAGE",
+        })
+        for item in extract_disk_downloads(page_html):
+            name = item["name"]
+            download_url = urllib.parse.urljoin(final_url, item["url"])
+            record: dict[str, object] = {
+                "object_id": item.get("object_id"),
+                "folder_id": parent_id,
+                "path": parent_path or folder_name,
+                "name": name,
+                "kind": "file",
+                "mime_type": disk_entry_mime(name),
+                "extension": disk_entry_extension(name),
+                "size": None,
+                "modified_at": None,
+                "version": None,
+                "source_url": final_url,
+                "download_url": download_url,
+                "read_at": raw_pages[-1]["read_at"],
+                "retrieval_method": "AUTHENTICATED_BITRIX_DISK_FOLDER_PAGE",
+                "download_status": "NOT_REQUESTED",
+            }
+            key = str(item.get("object_id") or download_url)
+            if key not in known_downloads:
+                known_downloads[key] = record
+                files.append(record)
+        for child in extract_shared_disk_child_folders(page_html, final_url):
+            child_path = "/".join(part for part in (parent_path, child["name"]) if part)
+            queue.append((child["url"], child_path, None))
+        for page_url in extract_disk_pagination_links(page_html, final_url):
+            queue.append((page_url, parent_path, parent_id))
+
+    if queue:
+        warnings.append("PROJECT_FOLDER_INVENTORY_PAGE_LIMIT_REACHED")
+
+    requested = {urllib.parse.urlsplit(url).path.rstrip("/") for url in download_file_urls}
+    for record in files:
+        download_url = str(record.get("download_url") or "")
+        parsed_download = urllib.parse.urlsplit(download_url)
+        if parsed_download.path.rstrip("/") not in requested and download_url not in download_file_urls:
+            continue
+        try:
+            final_url, content = client.fetch_binary(download_url)
+        except Exception as exc:
+            record["download_status"] = "DOWNLOAD_FAILED"
+            record["download_error"] = f"{type(exc).__name__}:{exc}"
+            continue
+        if is_probable_html(content):
+            record["download_status"] = "HTML_INSTEAD_OF_FILE"
+            record["download_error"] = "AUTH_OR_ERROR_HTML"
+            errors.append("PROJECT_FOLDER_FILE_HTML_INSTEAD_OF_BINARY")
+            continue
+        safe_name = safe_filename_from_url(str(record.get("name") or "file"), "file")
+        target = downloads_dir / safe_name
+        suffix = 2
+        while target.exists():
+            target = downloads_dir / f"{target.stem}-{suffix}{target.suffix}"
+            suffix += 1
+        save_binary_file(target, content)
+        record.update({
+            "download_status": "DOWNLOADED",
+            "download_url": final_url,
+            "local_file": str(target.relative_to(root)),
+            "size": len(content),
+            "mime_type": disk_entry_mime(target.name) or record.get("mime_type"),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+
+    inventory = {
+        "schema_version": "1.0",
+        "operation": "COLLECT_PROJECT_FOLDER",
+        "root_folder_url": folder_url,
+        "read_only": True,
+        "collected_at": now_iso(),
+        "coverage": {
+            "pages_collected": page_count,
+            "folders_collected": len(folders),
+            "files_collected": len(files),
+            "page_limit": max_pages,
+            "complete": not bool(queue),
+        },
+        "folders": folders,
+        "files": files,
+        "raw_pages": raw_pages,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    write_text_file(root / "project-folder-files.json", json.dumps(inventory, ensure_ascii=False, indent=2) + "\n")
+    report = {
+        "schema_version": "1.0", "operation": "COLLECT_PROJECT_FOLDER",
+        "status": "ok" if not errors and not queue else "partial" if not errors else "blocked",
+        "bridge_version": BRIDGE_VERSION, "bridge_contract_version": BRIDGE_CONTRACT_VERSION,
+        "inventory": str(root / "project-folder-files.json"), "started_at": started_at,
+        "finished_at": now_iso(), "errors": errors, "warnings": warnings,
+    }
+    write_text_file(root / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(str(root / "project-folder-files.json"))
+    return 0 if report["status"] == "ok" else 2
 
 
 def command_collect_deal_context(
@@ -1790,28 +2147,12 @@ def command_collect_deal_context(
 
     read_at = now_iso()
     field_schema = extract_field_schema(raw_html, raw_fields)
-    fields = [
-        {
-            "field_code": code,
-            "field_name": code,
-            "field_title": field_schema[code].get("field_title"),
-            "field_type": field_schema[code].get("field_type"),
-            "multiple": field_schema[code].get("multiple"),
-            "enumeration_options": field_schema[code].get("enumeration_options"),
-            "option_list_version": field_schema[code].get("option_list_version"),
-            "raw_value": value,
-            "normalized_value": value_from_signed_field(value),
-            "entity_type": "deal",
-            "entity_type_id": "2",
-            "entity_id": deal_id_value,
-            "source_url": final_url,
-            "read_at": read_at,
-            "retrieval_method": "AUTHENTICATED_DEAL_CARD_EMBEDDED_MODEL",
-            "availability": "PASS" if value_from_signed_field(value) else "FIELD_EMPTY",
-            "schema_metadata_source": field_schema[code].get("metadata_source"),
-        }
-        for code, value in sorted(raw_fields.items())
-    ]
+    fields = build_field_records(
+        field_schema, raw_fields,
+        entity_type="deal", entity_type_id="2", entity_id=deal_id_value,
+        source_url=final_url, read_at=read_at,
+        retrieval_method="AUTHENTICATED_DEAL_CARD_EMBEDDED_MODEL",
+    )
     file_refs = extract_crm_item_file_refs(raw_html)
     direct_file_links = extract_file_links(raw_html)
     documents: list[dict[str, object]] = []
@@ -1853,6 +2194,10 @@ def command_collect_deal_context(
         })
 
     related = extract_entity_refs(raw_html, final_url)
+    for related_ref in related:
+        related_ref["source_entity_type"] = "deal"
+        related_ref["source_entity_type_id"] = "2"
+        related_ref["source_entity_id"] = deal_id_value
     tabs = extract_tab_loaders(raw_html)
     snapshot = {
         "schema_version": "1.0",
@@ -3461,6 +3806,12 @@ def build_parser() -> argparse.ArgumentParser:
     entity_context_parser.add_argument("--expected-kind", choices=("contact", "company", "deal", "dynamic", "lead", "quote", "smart_invoice"))
     entity_context_parser.add_argument("--output-dir", required=True)
 
+    project_folder_parser = subparsers.add_parser("collect-project-folder")
+    project_folder_parser.add_argument("--folder-url", required=True)
+    project_folder_parser.add_argument("--output-dir", required=True)
+    project_folder_parser.add_argument("--download-file-url", action="append", default=[])
+    project_folder_parser.add_argument("--max-pages", type=int, default=200)
+
     chat_resolution_parser = subparsers.add_parser("record-deal-chat-resolution")
     chat_resolution_parser.add_argument("--deal-search-report", required=True)
     chat_resolution_parser.add_argument("--chat-url", required=True)
@@ -3555,6 +3906,14 @@ def main() -> int:
             args.output_dir,
             args.entity_url,
             args.expected_kind,
+        )
+    if args.command == "collect-project-folder":
+        return command_collect_project_folder(
+            client,
+            args.output_dir,
+            args.folder_url,
+            args.download_file_url,
+            args.max_pages,
         )
     if args.command == "list-companies":
         return command_list_companies(client, args.name_contains, args.max_pages)
