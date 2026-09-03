@@ -108,7 +108,7 @@ python3 scripts/bitrix24_session_client.py probe
 
 ```bash
 python3 scripts/bitrix24_session_client.py fetch \
-  /crm/deal/details/14325/ \
+  "/crm/deal/details/${DEAL_ID}/" \
   --format text
 ```
 

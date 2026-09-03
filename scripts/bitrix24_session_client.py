@@ -9,14 +9,17 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import html
 import http.client
 import http.cookiejar
+import hashlib
 import json
 import os
 import pathlib
 import re
+import shutil
 import socket
 import ssl
 import sys
@@ -30,10 +33,24 @@ from typing import Iterable
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parents[1]
 ENV_PATH = SKILL_DIR / ".env"
-DEFAULT_OUTPUT_DIR = pathlib.Path.cwd() / "bitrix24_company_contexts"
-COLLECT_MODES = ("quick", "full", "deep")
+BRIDGE_VERSION = "0.2.0-dev"
+BRIDGE_CONTRACT_VERSION = "1.0"
+BRIDGE_CAPABILITIES = (
+    "deal_outer_and_side_slider_fetch",
+    "exact_deal_model_selection",
+    "empty_registered_fields",
+    "field_schema_export",
+    "generic_exact_entity_collection",
+    "linked_entity_references",
+    "read_only_collection",
+)
+COLLECT_MODES = ("quick", "package", "full", "deep")
 DEFAULT_MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_DOCUMENT_DOWNLOADS = 120
+DEFAULT_MAX_RELATED_CARDS = 120
+INCOME_CONTRACT_LIST_PATH = "/page/dogovory/dokhodnye_dogovory/"
+INCOME_CONTRACT_LIST_URL = "https://crm.prof-4.ru/page/dogovory/dokhodnye_dogovory/"
+INCOME_CONTRACT_CHAIN_SELECTION_HINT = "ACTIVE_BASE_CONTRACT_CHAIN_COVERING_PROJECT_PERIOD"
 GENERATED_METADATA_FILES = (
     "communications.tsv",
     "company_details.json",
@@ -42,11 +59,18 @@ GENERATED_METADATA_FILES = (
     "document_entrypoints.json",
     "documents.json",
     "entity_links.json",
+    "income_contracts.json",
     "lazy_tabs.json",
     "related_entities.json",
     "run_report.json",
     "tabs.json",
     "timeline_highlights.json",
+)
+CORE_DOSSIER_FILES = (
+    "context.md",
+    "metadata/run_report.json",
+    "metadata/lazy_tabs.json",
+    "metadata/documents.json",
 )
 CRM_ENTITY_TYPES = {
     "1": "lead",
@@ -161,13 +185,17 @@ def slugify(value: str) -> str:
 def parse_deal_rows(raw_html: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     row_re = re.compile(
-        r'<tr class="main-grid-row main-grid-row-body".*?data-id="(?P<id>\d+)".*?</tr>',
+        r'<tr\b(?=[^>]*\bdata-id="(?P<id>\d+)")(?=[^>]*\bclass="[^"]*\bmain-grid-row\b)[^>]*>.*?</tr>',
         re.S,
     )
     for match in row_re.finditer(raw_html):
         row_html = match.group(0)
         deal_id = match.group("id")
-        detail_match = re.search(r'href="/crm/deal/details/\d+/">(?P<title>.*?)</a>', row_html, re.S)
+        detail_match = re.search(
+            r'href="(?P<url>/crm/deal/details/\d+/[^\"]*)"[^>]*>(?P<title>.*?)</a>',
+            row_html,
+            re.S,
+        )
         desc_matches = re.findall(r'<div class="crm-info-description-wrapper">(.*?)</div>', row_html, re.S)
         owner_matches = re.findall(r'<a href="/company/personal/user/\d+/".*?>(.*?)</a>', row_html, re.S)
         stage_matches = re.findall(
@@ -189,10 +217,401 @@ def parse_deal_rows(raw_html: str) -> list[dict[str, str]]:
                 "amount": "",
                 "date_create": "",
                 "contact": "",
-                "url": f"/crm/deal/details/{deal_id}/",
+                "url": detail_match.group("url") if detail_match else f"/crm/deal/details/{deal_id}/",
             }
         )
     return rows
+
+
+def normalize_four_digit_project_number(value: str) -> str:
+    """Return the CRM-searchable project number or fail before a broad search."""
+    number = str(value).strip()
+    if not re.fullmatch(r"\d{4}", number):
+        raise ValueError("Номер проекта для поиска чата сделки должен состоять ровно из четырёх цифр")
+    return number
+
+
+def normalized_crm_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip()
+
+
+def canonical_deal_url(value: object) -> str | None:
+    """Return a query-free URL identity for one CRM deal card.
+
+    The chat's ``ОТКРЫТЬ СДЕЛКУ`` link can legitimately add IFRAME parameters,
+    so equality is established by the exact deal id rather than by the raw URL.
+    """
+    raw = str(value or "").strip()
+    match = re.search(r"/crm/deal/details/(\d+)/", raw)
+    if not match:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    return f"{origin}/crm/deal/details/{match.group(1)}/"
+
+
+def read_json_object(path: str) -> dict[str, object]:
+    candidate = pathlib.Path(path)
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Не удалось прочитать JSON-доказательство: {candidate}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON-доказательство должно быть объектом: {candidate}")
+    return payload
+
+
+def command_find_deal_by_project_number(
+    client: "BitrixSessionClient", project_number: str, output: str
+) -> int:
+    """Resolve one deal by its exact four-digit project prefix, read-only.
+
+    This deliberately searches the CRM deal list through its native FIND query,
+    then accepts only titles beginning with ``NNNN:``.  A chat is not inferred
+    here: the master must open the selected card and verify the chat header.
+    """
+    number = normalize_four_digit_project_number(project_number)
+    target = "/crm/deal/list/?" + urllib.parse.urlencode({"FIND": number})
+    client.login_portal()
+    final_url, raw_html = client.fetch(target)
+    pattern = re.compile(rf"^\s*{re.escape(number)}\s*:")
+    matches = [row for row in parse_deal_rows(raw_html) if pattern.match(row["title"])]
+    by_id = {str(row["id"]): row for row in matches}
+    exact = list(by_id.values())
+
+    report: dict[str, object] = {
+        "schema_version": "1.0",
+        "operation": "EXACT_DEAL_LOOKUP_FOR_CRM_CHAT",
+        "project_number": number,
+        "search_url": final_url,
+        "match_rule": f"deal title begins with {number}:",
+        "status": "PASS" if len(exact) == 1 else "BLOCKED",
+        "candidates": [
+            {
+                "deal_id": row["id"],
+                "title": row["title"],
+                "deal_url": to_absolute(client.base_url, row["url"]),
+            }
+            for row in exact
+        ],
+    }
+    if len(exact) == 1:
+        row = exact[0]
+        report["selected_deal"] = {
+            "deal_id": row["id"],
+            "title": row["title"],
+            "deal_url": to_absolute(client.base_url, row["url"]),
+        }
+    elif not exact:
+        report["blocker"] = "DEAL_PROJECT_NUMBER_NOT_FOUND"
+    else:
+        report["blocker"] = "DEAL_PROJECT_NUMBER_NOT_UNIQUE"
+
+    output_path = pathlib.Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_file(output_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["status"] == "PASS" else 2
+
+
+def command_record_deal_chat_resolution(
+    deal_search_report: str,
+    chat_url: str,
+    chat_header: str,
+    open_deal_url: str,
+    resolved_tax_status: str,
+    message_locators: list[str],
+    message_text: str,
+    reviewed_at: str,
+    output: str,
+) -> int:
+    """Create one validated handoff from an interactive CRM chat review.
+
+    Messages in this portal are loaded dynamically.  The browser-capable agent
+    reads the visible chat and passes only the exact, reviewable facts here;
+    this command neither falls back to an HTTP snapshot nor guesses a status.
+    """
+    search = read_json_object(deal_search_report)
+    selected = search.get("selected_deal")
+    errors: list[str] = []
+    if search.get("status") != "PASS" or not isinstance(selected, dict):
+        errors.append("DEAL_SEARCH_REPORT_NOT_UNAMBIGUOUS")
+        selected = {}
+
+    project_number = normalize_four_digit_project_number(str(search.get("project_number", "")))
+    selected_title = normalized_crm_text(selected.get("title"))
+    selected_url = str(selected.get("deal_url", ""))
+    selected_canonical = canonical_deal_url(selected_url)
+    selected_deal_id = str(selected.get("deal_id", "")).strip()
+    expected_header = normalized_crm_text(f"Сделка: {selected_title}")
+    if not selected_title or normalized_crm_text(chat_header) != expected_header:
+        errors.append("CRM_DEAL_CHAT_HEADER_MISMATCH")
+
+    opened_canonical = canonical_deal_url(open_deal_url)
+    if not selected_canonical or opened_canonical != selected_canonical:
+        errors.append("CRM_DEAL_CHAT_LINK_MISMATCH")
+
+    status = str(resolved_tax_status or "").strip().upper()
+    if status not in {"SMZ", "IP", "FL"}:
+        errors.append("CRM_DEAL_CHAT_FINAL_STATUS_INVALID")
+    locators = [normalized_crm_text(item) for item in message_locators if normalized_crm_text(item)]
+    if not locators or not normalized_crm_text(message_text):
+        errors.append("CRM_DEAL_CHAT_FINAL_ASSIGNMENT_NOT_EXPLICIT")
+    try:
+        dt.date.fromisoformat(str(reviewed_at))
+    except ValueError:
+        errors.append("CRM_DEAL_CHAT_REVIEW_DATE_INVALID")
+    if not str(chat_url or "").strip():
+        errors.append("CRM_DEAL_CHAT_NOT_OPENED")
+
+    report: dict[str, object] = {
+        "schema_version": "1.1",
+        "operation": "INTERACTIVE_CRM_DEAL_CHAT_TAX_STATUS_RESOLUTION",
+        "verification_method": "INTERACTIVE_BROWSER_SESSION",
+        "status": "RESOLVED" if not errors else "UNRESOLVED",
+        "resolved_tax_status": status if status in {"SMZ", "IP", "FL"} else None,
+        "final_assignment_explicit": bool(locators and normalized_crm_text(message_text)),
+        "deal_match_unambiguous": search.get("status") == "PASS" and bool(selected_deal_id),
+        "deal_id": selected_deal_id or None,
+        "deal_url": selected_url or None,
+        "project_number": project_number,
+        "deal_search_report": deal_search_report,
+        "chat_url": str(chat_url or "").strip() or None,
+        "chat_header": normalized_crm_text(chat_header),
+        "chat_header_verified": "CRM_DEAL_CHAT_HEADER_MISMATCH" not in errors,
+        "open_deal_url": str(open_deal_url or "").strip() or None,
+        "chat_deal_url_verified": "CRM_DEAL_CHAT_LINK_MISMATCH" not in errors,
+        "message_locators": locators,
+        "message_text_sha256": hashlib.sha256(normalized_crm_text(message_text).encode("utf-8")).hexdigest()
+        if normalized_crm_text(message_text) else None,
+        "reviewed_at": str(reviewed_at),
+        "resolution_reason": "EXPLICIT_STATUS_ASSIGNMENT" if not errors else None,
+        "errors": errors,
+    }
+    output_path = pathlib.Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_file(output_path, json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if not errors else 2
+
+
+class MainGridRowParser(HTMLParser):
+    """Extract top-level cells from Bitrix main-grid body rows."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[dict[str, object]] = []
+        self.active = False
+        self.tr_depth = 0
+        self.cell_depth = 0
+        self.row_id = ""
+        self.cells: list[dict[str, object]] = []
+        self.current_cell: dict[str, object] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = {key: value or "" for key, value in attrs}
+        if tag == "tr":
+            classes = set(attrs_dict.get("class", "").split())
+            if not self.active and {"main-grid-row", "main-grid-row-body"}.issubset(classes):
+                self.active = True
+                self.tr_depth = 1
+                self.row_id = attrs_dict.get("data-id", "")
+                self.cells = []
+                return
+            if self.active:
+                self.tr_depth += 1
+        if not self.active:
+            return
+        if tag == "td":
+            if self.current_cell is None and self.tr_depth == 1:
+                self.current_cell = {"text": [], "links": [], "data_srcs": []}
+                self.cell_depth = 1
+            elif self.current_cell is not None:
+                self.cell_depth += 1
+            return
+        if self.current_cell is not None and tag == "a":
+            href = attrs_dict.get("href", "")
+            data_src = attrs_dict.get("data-src", "")
+            if href:
+                links = self.current_cell["links"]
+                assert isinstance(links, list)
+                links.append(html.unescape(href))
+            if data_src:
+                sources = self.current_cell["data_srcs"]
+                assert isinstance(sources, list)
+                sources.append(html.unescape(data_src))
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.active:
+            return
+        if tag == "td" and self.current_cell is not None:
+            self.cell_depth -= 1
+            if self.cell_depth == 0:
+                chunks = self.current_cell["text"]
+                assert isinstance(chunks, list)
+                self.current_cell["text"] = re.sub(r"\s+", " ", " ".join(chunks)).strip()
+                self.cells.append(self.current_cell)
+                self.current_cell = None
+            return
+        if tag == "tr":
+            self.tr_depth -= 1
+            if self.tr_depth == 0:
+                self.rows.append({"id": self.row_id, "cells": self.cells})
+                self.active = False
+
+    def handle_data(self, data: str) -> None:
+        if self.current_cell is not None and data.strip():
+            chunks = self.current_cell["text"]
+            assert isinstance(chunks, list)
+            chunks.append(data.strip())
+
+
+def main_grid_headers(raw_html: str) -> list[dict[str, str]]:
+    headers: list[dict[str, str]] = []
+    for match in re.finditer(r"<th\b(?P<attrs>[^>]*)>(?P<body>.*?)</th>", raw_html, re.S | re.I):
+        name_match = re.search(r'data-name="([^"]+)"', match.group("attrs"), re.I)
+        title_match = re.search(
+            r'<span[^>]*class="[^"]*main-grid-head-title[^"]*"[^>]*>(.*?)</span>',
+            match.group("body"),
+            re.S | re.I,
+        )
+        if name_match and title_match:
+            headers.append({"name": name_match.group(1), "title": strip_tags(title_match.group(1))})
+    return headers
+
+
+def grid_sort_url(raw_html: str, header_title: str) -> str:
+    expected = re.sub(r"\s+", " ", header_title).strip().casefold()
+    for match in re.finditer(r"<th\b(?P<attrs>[^>]*)>(?P<body>.*?)</th>", raw_html, re.S | re.I):
+        title_match = re.search(
+            r'<span[^>]*class="[^"]*main-grid-head-title[^"]*"[^>]*>(.*?)</span>',
+            match.group("body"),
+            re.S | re.I,
+        )
+        if not title_match or strip_tags(title_match.group(1)).casefold() != expected:
+            continue
+        url_match = re.search(r'data-sort-url="([^"]+)"', match.group("attrs"), re.I)
+        if not url_match:
+            return ""
+        raw_url = html.unescape(url_match.group(1))
+        parsed = urllib.parse.urlsplit(raw_url)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(key, value) for key, value in query if key.casefold() != "order"]
+        query.append(("order", "asc"))
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), parsed.fragment)
+        )
+    return ""
+
+
+def parse_income_contract_rows(raw_html: str) -> list[dict[str, object]]:
+    """Parse the canonical CRM income-contract grid (dynamic type 142)."""
+    headers = main_grid_headers(raw_html)
+    parser = MainGridRowParser()
+    parser.feed(raw_html)
+    rows: list[dict[str, object]] = []
+    for parsed in parser.rows:
+        cells = parsed.get("cells")
+        if not isinstance(cells, list) or len(cells) < len(headers) + 2:
+            continue
+        mapped = {
+            header["title"]: cells[index + 2]
+            for index, header in enumerate(headers)
+        }
+        row_id = str(parsed.get("id") or "")
+        if not row_id.isdigit():
+            continue
+        title_cell = mapped.get("Название") or {}
+        file_cell = mapped.get("Файл договора") or {}
+        title_links = title_cell.get("links") if isinstance(title_cell, dict) else []
+        file_links = file_cell.get("data_srcs") if isinstance(file_cell, dict) else []
+        detail_url = next(
+            (str(link) for link in (title_links or []) if f"/details/{row_id}/" in str(link)),
+            "",
+        )
+        text_fields = {
+            title: str(cell.get("text") or "")
+            for title, cell in mapped.items()
+            if isinstance(cell, dict)
+        }
+
+        def first_field(*titles: str) -> tuple[str, str]:
+            normalized_fields = {
+                re.sub(r"\s+", " ", key).strip().casefold(): (key, value)
+                for key, value in text_fields.items()
+            }
+            for title in titles:
+                match = normalized_fields.get(title.casefold())
+                if match and match[1].strip():
+                    return match
+            return "", ""
+
+        company_field, company_name = first_field(
+            "Компания", "Клиент", "Заказчик", "ДО", "Юридическое лицо"
+        )
+        period_field, validity_period = first_field("Срок действия", "Период действия")
+        start_field, validity_start = first_field(
+            "Дата начала действия", "Начало действия", "Действует с", "Дата начала"
+        )
+        end_field, validity_end = first_field(
+            "Дата окончания действия",
+            "Окончание действия",
+            "Действует до",
+            "Дата окончания",
+            "Срок договора до",
+        )
+        validity_fields = [
+            field for field in (period_field, start_field, end_field) if field
+        ]
+        relation_text = "\n".join(
+            [
+                str(title_cell.get("text") or "") if isinstance(title_cell, dict) else "",
+                str((mapped.get("Номер договора") or {}).get("text") or ""),
+                *(f"{key}: {value}" for key, value in text_fields.items()),
+            ]
+        )
+        parent_numbers = []
+        for pattern in (
+            r"\b(?:к|по)\s+(?:рамочн\w*\s+)?договор\w*\s*(?:№|N)?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9_./-]*)",
+            r"\bдс\s*№?\s*[A-Za-zА-Яа-яЁё0-9_./-]*\s+к\s+(?!договор\w*\b)(?:№|N)?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9_./-]*)",
+        ):
+            parent_numbers.extend(match.group(1) for match in re.finditer(pattern, relation_text, re.IGNORECASE))
+        rows.append(
+            {
+                "id": row_id,
+                "title": str(title_cell.get("text") or "") if isinstance(title_cell, dict) else "",
+                "conclusion_date": str((mapped.get("Дата заключения") or {}).get("text") or ""),
+                "contract_form": str((mapped.get("Форма договора") or {}).get("text") or ""),
+                "contract_number": str((mapped.get("Номер договора") or {}).get("text") or ""),
+                "detail_url": detail_url,
+                "contract_file_label": str(file_cell.get("text") or "") if isinstance(file_cell, dict) else "",
+                "contract_file_urls": list(dict.fromkeys(str(item) for item in (file_links or []) if item)),
+                "company_name": company_name,
+                "company_field": company_field,
+                "fields": text_fields,
+                "parent_contract_numbers": list(dict.fromkeys(parent_numbers)),
+                "validity": {
+                    "status": "PASS" if validity_period or validity_end else "MISSING",
+                    "period_text": validity_period,
+                    "start_date": validity_start,
+                    "end_date": validity_end,
+                    "field_names": validity_fields,
+                    "source_url": INCOME_CONTRACT_LIST_URL,
+                    "row_id": row_id,
+                },
+            }
+        )
+    return rows
+
+
+def paged_url(raw_url: str, page: int) -> str:
+    parsed = urllib.parse.urlsplit(raw_url)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query = [(key, value) for key, value in query if key.casefold() != "page"]
+    query.append(("page", str(page)))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), parsed.fragment)
+    )
 
 
 def normalize_crm_path(raw_url: str) -> str:
@@ -277,13 +696,19 @@ def extract_entity_refs(raw_html: str, source: str = "") -> list[dict[str, str]]
         if path and title:
             title_by_url.setdefault(path, title)
 
+    # Searching from every `text` field to a later redirect action across the
+    # whole CRM page causes catastrophic regex backtracking on large cards.
+    # Match redirect actions linearly, then look for the closest title only in
+    # a bounded prefix of the surrounding serialized block.
     redirect_re = re.compile(
-        r'"text":"(?P<title>(?:\\.|[^"])*)".*?"action":\{"type":"redirect","value":"(?P<url>(?:\\.|[^"])*)"\}',
-        re.S,
+        r'"action":\{"type":"redirect","value":"(?P<url>(?:\\.|[^"])*)"\}'
     )
+    title_re = re.compile(r'"text":"(?P<title>(?:\\.|[^"])*)"')
     for match in redirect_re.finditer(raw_html):
         path = normalize_crm_path(match.group("url"))
-        title = js_unescape(match.group("title"))
+        prefix = raw_html[max(0, match.start() - 4000) : match.start()]
+        title_matches = list(title_re.finditer(prefix))
+        title = js_unescape(title_matches[-1].group("title")) if title_matches else ""
         if path and title:
             title_by_url.setdefault(path, title)
 
@@ -350,6 +775,172 @@ def extract_entity_data_objects(raw_html: str) -> list[dict[str, object]]:
         if isinstance(data, dict):
             objects.append({"entity_type_id": match.group("type"), "data": data})
     return objects
+
+
+def infer_field_type(value: object) -> tuple[str, bool]:
+    """Return a conservative transport type when Bitrix did not expose schema."""
+    if isinstance(value, list):
+        return "multiple", True
+    if isinstance(value, bool):
+        return "boolean", False
+    if isinstance(value, int):
+        return "integer", False
+    if isinstance(value, float):
+        return "decimal", False
+    if isinstance(value, dict):
+        if "VALUE" in value:
+            return infer_field_type(value.get("VALUE"))
+        return "crm_reference", False
+    return "string", False
+
+
+def extract_field_schema(raw_html: str, raw_fields: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Extract schema fragments without inventing titles that the page did not expose.
+
+    Bitrix installations serialize field configuration in several slightly
+    different JavaScript shapes.  This parser intentionally accepts only an
+    explicit field code followed by an object; unobserved metadata remains null.
+    """
+    schema: dict[str, dict[str, object]] = {}
+    for code, value in raw_fields.items():
+        inferred_type, inferred_multiple = infer_field_type(value)
+        schema[code] = {
+            "field_code": code,
+            "field_title": None,
+            "field_type": inferred_type,
+            "multiple": inferred_multiple,
+            "metadata_source": "VALUE_TYPE_INFERENCE",
+        }
+
+    def balanced_array(start: int) -> str | None:
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        for index in range(start, len(raw_html)):
+            char = raw_html[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char in {"'", '"'}:
+                quote = char
+            elif char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    return raw_html[start:index + 1]
+        return None
+
+    def walk(value: object) -> Iterable[dict[str, object]]:
+        if isinstance(value, dict):
+            if value.get("name") in raw_fields and isinstance(value.get("data"), dict):
+                yield value
+            for child in value.values():
+                yield from walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk(child)
+
+    # The entity editor's ``current`` config is Python-literal-compatible after
+    # replacing JavaScript primitives. It carries the real title/type/list data.
+    for current_match in re.finditer(r"\bcurrent\s*:\s*\[", raw_html):
+        array_start = raw_html.find("[", current_match.start())
+        array_text = balanced_array(array_start)
+        if not array_text:
+            continue
+        literal = re.sub(r"\btrue\b", "True", array_text)
+        literal = re.sub(r"\bfalse\b", "False", literal)
+        literal = re.sub(r"\bnull\b", "None", literal)
+        try:
+            current_config = ast.literal_eval(literal)
+        except (SyntaxError, ValueError):
+            continue
+        for definition in walk(current_config):
+            code = str(definition.get("name"))
+            record = schema[code]
+            data = definition.get("data") if isinstance(definition.get("data"), dict) else {}
+            info = data.get("fieldInfo") if isinstance(data.get("fieldInfo"), dict) else {}
+            record["field_title"] = str(definition.get("title") or "").strip() or record.get("field_title")
+            record["field_type"] = str(info.get("USER_TYPE_ID") or definition.get("type") or record.get("field_type"))
+            multiple = info.get("MULTIPLE")
+            if multiple is not None:
+                record["multiple"] = str(multiple).upper() in {"Y", "TRUE", "1"}
+            enum_rows = info.get("ENUM")
+            if isinstance(enum_rows, list):
+                options = {str(item.get("ID")): str(item.get("VALUE") or "") for item in enum_rows
+                           if isinstance(item, dict) and item.get("ID") is not None}
+                if options:
+                    record["enumeration_options"] = options
+                    record["option_list_version"] = "sha256:" + hashlib.sha256(
+                        json.dumps(options, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest()
+            record["metadata_source"] = "BITRIX_ENTITY_EDITOR_CURRENT_CONFIG"
+
+    code_pattern = re.compile(r"(?P<quote>['\"])(?P<code>[A-Z][A-Z0-9_]+)(?P=quote)\s*:\s*\{")
+    for match in code_pattern.finditer(raw_html):
+        code = match.group("code")
+        if code not in raw_fields:
+            continue
+        extracted = extract_balanced_object(raw_html, match.end() - 1)
+        if not extracted:
+            continue
+        fragment, _ = extracted
+        parsed_fragment: dict[str, object] = {}
+        try:
+            candidate_fragment = json.loads(fragment)
+            if isinstance(candidate_fragment, dict):
+                parsed_fragment = candidate_fragment
+        except json.JSONDecodeError:
+            pass
+
+        def scalar(*names: str) -> str | None:
+            for name in names:
+                found = re.search(
+                    rf"['\"]{re.escape(name)}['\"]\s*:\s*['\"](?P<value>[^'\"]*)['\"]",
+                    fragment,
+                    re.I,
+                )
+                if found:
+                    return html.unescape(found.group("value")).strip() or None
+            return None
+
+        title = scalar("title", "formLabel", "listLabel", "EDIT_FORM_LABEL")
+        field_type = scalar("type", "dataType", "USER_TYPE_ID")
+        multiple_match = re.search(
+            r"['\"](?:multiple|MULTIPLE)['\"]\s*:\s*(?P<value>true|false|['\"][YN]['\"])",
+            fragment,
+            re.I,
+        )
+        record = schema[code]
+        if title:
+            record["field_title"] = title
+        if field_type:
+            record["field_type"] = field_type
+        if multiple_match:
+            record["multiple"] = multiple_match.group("value").strip("'\"").lower() in {"true", "y"}
+        option_source = parsed_fragment.get("items") or parsed_fragment.get("options")
+        options: dict[str, str] = {}
+        if isinstance(option_source, list):
+            for option in option_source:
+                if isinstance(option, dict) and (option.get("ID") is not None or option.get("id") is not None):
+                    option_id = str(option.get("ID") if option.get("ID") is not None else option.get("id"))
+                    option_value = option.get("VALUE") if option.get("VALUE") is not None else option.get("value")
+                    options[option_id] = str(option_value or "")
+        elif isinstance(option_source, dict):
+            options = {str(key): str(value) for key, value in option_source.items()}
+        if options:
+            record["enumeration_options"] = options
+            record["option_list_version"] = "sha256:" + hashlib.sha256(
+                json.dumps(options, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        if title or field_type or multiple_match or options:
+            record["metadata_source"] = "BITRIX_EMBEDDED_FIELD_CONFIG"
+    return schema
 
 
 def value_from_signed_field(value: object) -> str:
@@ -900,7 +1491,6 @@ def command_probe(client: BitrixSessionClient) -> int:
         "/market/hooks/",
         "/market/category/local/",
         "/market/",
-        "/crm/deal/details/14325/",
     ]
     for path in probe_paths:
         try:
@@ -927,6 +1517,388 @@ def command_fetch(client: BitrixSessionClient, target: str, fmt: str) -> int:
             print(link)
         return 0
     raise SystemExit(f"Неподдерживаемый формат: {fmt}")
+
+
+def command_contract(output: str | None) -> int:
+    payload = {
+        "schema_version": "1.0",
+        "bridge_name": "bitrix24-session-bridge",
+        "bridge_version": BRIDGE_VERSION,
+        "contract_version": BRIDGE_CONTRACT_VERSION,
+        "capabilities": list(BRIDGE_CAPABILITIES),
+        "commands": [
+            "collect-deal-context",
+            "collect-entity-context",
+            "collect-company-context",
+            "list-income-contracts",
+        ],
+        "read_only": True,
+    }
+    rendered = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if output:
+        write_text_file(pathlib.Path(output).expanduser().resolve(), rendered)
+    else:
+        sys.stdout.write(rendered)
+    return 0
+
+
+def command_collect_entity_context(
+    client: BitrixSessionClient,
+    output_dir: str,
+    entity_url: str,
+    expected_kind: str | None,
+) -> int:
+    """Collect one explicitly selected CRM entity; never search for a substitute."""
+    root = pathlib.Path(output_dir).expanduser().resolve()
+    raw_dir = ensure_dir(root / "raw")
+    meta_dir = ensure_dir(root / "metadata")
+    started_at = now_iso()
+    parsed = urllib.parse.urlparse(entity_url)
+    ref = classify_entity_path(parsed.path)
+    errors: list[str] = []
+    if ref is None:
+        errors.append("ENTITY_URL_INVALID")
+    elif expected_kind and ref.get("kind") != expected_kind:
+        errors.append("ENTITY_KIND_MISMATCH")
+    if errors:
+        report = {
+            "schema_version": "1.0",
+            "operation": "COLLECT_ENTITY_CONTEXT",
+            "status": "blocked",
+            "bridge_version": BRIDGE_VERSION,
+            "bridge_contract_version": BRIDGE_CONTRACT_VERSION,
+            "errors": errors,
+            "started_at": started_at,
+            "finished_at": now_iso(),
+        }
+        write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        return 2
+
+    assert ref is not None
+    expected_type_id = str(ref["entity_type_id"])
+    expected_id = str(ref["id"])
+    attempts: list[dict[str, object]] = []
+
+    def exact(page_html: str) -> list[dict[str, object]]:
+        return [
+            item for item in extract_entity_data_objects(page_html)
+            if str(item.get("entity_type_id")) == expected_type_id
+            and isinstance(item.get("data"), dict)
+            and value_from_signed_field(item["data"].get("ID")) == expected_id
+        ]
+
+    outer_url, outer_html = client.fetch(entity_url)
+    write_text_file(raw_dir / "entity-outer.html", outer_html)
+    matches = exact(outer_html)
+    attempts.append({"kind": "OUTER", "url": outer_url, "exact_model_count": len(matches)})
+    final_url, raw_html = outer_url, outer_html
+    if len(matches) != 1:
+        iframe_url, iframe_html = client.fetch(make_iframe_path(entity_url))
+        write_text_file(raw_dir / "entity-iframe.html", iframe_html)
+        iframe_matches = exact(iframe_html)
+        attempts.append({"kind": "SIDE_SLIDER", "url": iframe_url, "exact_model_count": len(iframe_matches)})
+        if len(iframe_matches) == 1:
+            final_url, raw_html, matches = iframe_url, iframe_html, iframe_matches
+
+    if len(matches) != 1:
+        errors.append("ENTITY_EXACT_MACHINE_MODEL_NOT_UNIQUE")
+        raw_fields: dict[str, object] = {}
+    else:
+        raw_fields = dict(matches[0]["data"])
+    schema = extract_field_schema(raw_html, raw_fields)
+    read_at = now_iso()
+    fields = [{
+        "field_code": code,
+        "field_name": code,
+        "field_title": schema[code].get("field_title"),
+        "field_type": schema[code].get("field_type"),
+        "multiple": schema[code].get("multiple"),
+        "enumeration_options": schema[code].get("enumeration_options"),
+        "option_list_version": schema[code].get("option_list_version"),
+        "raw_value": value,
+        "normalized_value": value_from_signed_field(value),
+        "entity_type": ref["kind"],
+        "entity_type_id": expected_type_id,
+        "entity_id": expected_id,
+        "source_url": final_url,
+        "read_at": read_at,
+        "retrieval_method": "AUTHENTICATED_ENTITY_CARD_EMBEDDED_MODEL",
+        "availability": "PASS" if value_from_signed_field(value) else "FIELD_EMPTY",
+        "schema_metadata_source": schema[code].get("metadata_source"),
+    } for code, value in sorted(raw_fields.items())]
+    entity = {
+        "schema_version": "1.0",
+        "entity_type": ref["kind"],
+        "entity_type_id": expected_type_id,
+        "entity_id": expected_id,
+        "source_url": final_url,
+        "read_at": read_at,
+        "raw_html_sha256": hashlib.sha256(raw_html.encode("utf-8")).hexdigest(),
+        "fetch_attempts": attempts,
+    }
+    write_text_file(meta_dir / "entity.json", json.dumps(entity, ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "fields.json", json.dumps(fields, ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "field_schema.json", json.dumps(list(schema.values()), ensure_ascii=False, indent=2) + "\n")
+    status = "ok" if fields and not errors else "blocked"
+    report = {
+        "schema_version": "1.0",
+        "operation": "COLLECT_ENTITY_CONTEXT",
+        "status": status,
+        "bridge_version": BRIDGE_VERSION,
+        "bridge_contract_version": BRIDGE_CONTRACT_VERSION,
+        "selected_entity": entity,
+        "counts": {"fields": len(fields), "field_schema": len(schema)},
+        "fetch_attempts": attempts,
+        "errors": errors,
+        "started_at": started_at,
+        "finished_at": now_iso(),
+    }
+    write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(str(meta_dir / "run_report.json"))
+    return 0 if status == "ok" else 2
+
+
+def command_collect_deal_context(
+    client: BitrixSessionClient,
+    output_dir: str,
+    project_number: str | None,
+    deal_id: str | None,
+    deal_url: str | None,
+    skip_document_downloads: bool,
+) -> int:
+    """Collect one exact deal as reusable read-only machine data.
+
+    The command exposes only portal mechanics: raw deal fields, linked
+    entities, file references, lazy-tab descriptors, provenance, and a
+    completeness report. It does not calculate downstream business readiness.
+    """
+    root = pathlib.Path(output_dir).expanduser().resolve()
+    raw_dir = ensure_dir(root / "raw")
+    meta_dir = ensure_dir(root / "metadata")
+    documents_dir = ensure_dir(root / "documents")
+    started_at = now_iso()
+    errors: list[str] = []
+    warnings: list[str] = []
+    candidates: list[dict[str, str]] = []
+    selected: dict[str, str] | None = None
+
+    client.login_portal()
+    if project_number:
+        number = normalize_four_digit_project_number(project_number)
+        search_path = "/crm/deal/list/?" + urllib.parse.urlencode({"FIND": number})
+        search_url, search_html = client.fetch(search_path)
+        pattern = re.compile(rf"^\s*{re.escape(number)}\s*:")
+        by_id = {
+            row["id"]: row
+            for row in parse_deal_rows(search_html)
+            if pattern.match(row.get("title", ""))
+        }
+        candidates = [
+            {
+                "deal_id": row["id"],
+                "title": row.get("title", ""),
+                "deal_url": to_absolute(client.base_url, row["url"]),
+            }
+            for row in by_id.values()
+        ]
+        write_text_file(raw_dir / "deal-search.html", search_html)
+        if len(candidates) == 1:
+            selected = candidates[0]
+        elif not candidates:
+            errors.append("ENTITY_NOT_FOUND")
+        else:
+            errors.append("ENTITY_NOT_UNIQUE")
+        deal_search_source = search_url
+    elif deal_id:
+        normalized_id = str(deal_id).strip()
+        if not normalized_id.isdigit():
+            errors.append("DEAL_ID_INVALID")
+        else:
+            selected = {
+                "deal_id": normalized_id,
+                "title": "",
+                "deal_url": to_absolute(client.base_url, f"/crm/deal/details/{normalized_id}/"),
+            }
+        deal_search_source = "DIRECT_DEAL_ID"
+    else:
+        canonical = canonical_deal_url(deal_url)
+        if not canonical:
+            errors.append("DEAL_URL_INVALID")
+        else:
+            normalized_id = extract_deal_id_from_path(urllib.parse.urlparse(canonical).path) or ""
+            selected = {"deal_id": normalized_id, "title": "", "deal_url": canonical}
+        deal_search_source = "DIRECT_DEAL_URL"
+
+    if selected is None:
+        report = {
+            "schema_version": "1.0",
+            "operation": "COLLECT_DEAL_CONTEXT",
+            "status": "blocked",
+            "started_at": started_at,
+            "finished_at": now_iso(),
+            "search_source": deal_search_source,
+            "candidates": candidates,
+            "errors": errors,
+            "warnings": warnings,
+        }
+        write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        print(str(meta_dir / "run_report.json"))
+        return 2
+
+    deal_id_value = selected["deal_id"]
+    outer_url, outer_html = client.fetch(selected["deal_url"])
+    if 'name="form_auth"' in outer_html:
+        errors.append("SOURCE_UNAVAILABLE")
+    write_text_file(raw_dir / "deal-outer.html", outer_html)
+    write_text_file(raw_dir / "deal-outer.txt", clean_text(outer_html) + "\n")
+
+    attempts: list[dict[str, object]] = []
+
+    def exact_deal_objects(page_html: str) -> list[dict[str, object]]:
+        objects = extract_entity_data_objects(page_html)
+        return [
+            item for item in objects
+            if str(item.get("entity_type_id")) == "2"
+            and isinstance(item.get("data"), dict)
+            and value_from_signed_field(item["data"].get("ID")) == deal_id_value
+        ]
+
+    final_url, raw_html = outer_url, outer_html
+    exact_objects = exact_deal_objects(outer_html)
+    attempts.append({"kind": "OUTER", "url": outer_url, "exact_model_count": len(exact_objects)})
+    if len(exact_objects) != 1:
+        iframe_target = make_iframe_path(selected["deal_url"])
+        iframe_url, iframe_html = client.fetch(iframe_target)
+        write_text_file(raw_dir / "deal-iframe.html", iframe_html)
+        write_text_file(raw_dir / "deal-iframe.txt", clean_text(iframe_html) + "\n")
+        iframe_exact = exact_deal_objects(iframe_html)
+        attempts.append({"kind": "SIDE_SLIDER", "url": iframe_url, "exact_model_count": len(iframe_exact)})
+        if len(iframe_exact) == 1:
+            final_url, raw_html, exact_objects = iframe_url, iframe_html, iframe_exact
+
+    # Compatibility aliases retained for existing consumers.
+    write_text_file(raw_dir / "deal.html", raw_html)
+    write_text_file(raw_dir / "deal.txt", clean_text(raw_html) + "\n")
+
+    selected_object = exact_objects[0] if len(exact_objects) == 1 else None
+    if selected_object is None:
+        errors.append("DEAL_EXACT_MACHINE_MODEL_NOT_UNIQUE")
+        raw_fields: dict[str, object] = {}
+    else:
+        raw_fields = dict(selected_object.get("data", {}))
+        selected["title"] = value_from_signed_field(raw_fields.get("TITLE")) or selected.get("title", "")
+
+    read_at = now_iso()
+    field_schema = extract_field_schema(raw_html, raw_fields)
+    fields = [
+        {
+            "field_code": code,
+            "field_name": code,
+            "field_title": field_schema[code].get("field_title"),
+            "field_type": field_schema[code].get("field_type"),
+            "multiple": field_schema[code].get("multiple"),
+            "enumeration_options": field_schema[code].get("enumeration_options"),
+            "option_list_version": field_schema[code].get("option_list_version"),
+            "raw_value": value,
+            "normalized_value": value_from_signed_field(value),
+            "entity_type": "deal",
+            "entity_type_id": "2",
+            "entity_id": deal_id_value,
+            "source_url": final_url,
+            "read_at": read_at,
+            "retrieval_method": "AUTHENTICATED_DEAL_CARD_EMBEDDED_MODEL",
+            "availability": "PASS" if value_from_signed_field(value) else "FIELD_EMPTY",
+            "schema_metadata_source": field_schema[code].get("metadata_source"),
+        }
+        for code, value in sorted(raw_fields.items())
+    ]
+    file_refs = extract_crm_item_file_refs(raw_html)
+    direct_file_links = extract_file_links(raw_html)
+    documents: list[dict[str, object]] = []
+    for ref in file_refs:
+        record: dict[str, object] = {
+            "field_name": ref["field_name"],
+            "file_id": ref["file_id"],
+            "source_url": to_absolute(client.base_url, ref["url"]),
+            "retrieval_method": "CRM_CONTROLLER_ITEM_GET_FILE",
+            "availability": "REFERENCE_ONLY" if skip_document_downloads else "PENDING",
+        }
+        if not skip_document_downloads:
+            try:
+                resolved_url, content = client.fetch_binary(ref["url"])
+                extension = guess_extension(content)
+                file_name = f"{slugify(ref['field_name'])}_{ref['file_id']}{extension}"
+                destination = documents_dir / file_name
+                save_binary_file(destination, content)
+                record.update({
+                    "resolved_url": resolved_url,
+                    "local_path": str(pathlib.Path("documents") / file_name),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                    "availability": "PASS",
+                })
+            except Exception as exc:
+                record["availability"] = "SOURCE_UNAVAILABLE"
+                record["error"] = error_text(exc)
+                warnings.append(f"FILE_DOWNLOAD_FAILED:{ref['field_name']}:{ref['file_id']}")
+        documents.append(record)
+    for url in direct_file_links:
+        absolute = to_absolute(client.base_url, url)
+        if any(item.get("source_url") == absolute for item in documents):
+            continue
+        documents.append({
+            "source_url": absolute,
+            "retrieval_method": "DEAL_CARD_DIRECT_LINK",
+            "availability": "REFERENCE_ONLY",
+        })
+
+    related = extract_entity_refs(raw_html, final_url)
+    tabs = extract_tab_loaders(raw_html)
+    snapshot = {
+        "schema_version": "1.0",
+        "entity_type": "deal",
+        "entity_id": deal_id_value,
+        "title": selected.get("title", ""),
+        "source_url": final_url,
+        "read_at": read_at,
+        "retrieval_method": "BITRIX24_SESSION_BRIDGE",
+        "raw_html_sha256": hashlib.sha256(raw_html.encode("utf-8")).hexdigest(),
+        "outer_url": outer_url,
+        "fetch_attempts": attempts,
+    }
+    write_text_file(meta_dir / "deal.json", json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "fields.json", json.dumps(fields, ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "field_schema.json", json.dumps(list(field_schema.values()), ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "files.json", json.dumps(documents, ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "related_entities.json", json.dumps(related, ensure_ascii=False, indent=2) + "\n")
+    write_text_file(meta_dir / "tabs.json", json.dumps(tabs, ensure_ascii=False, indent=2) + "\n")
+
+    status = "ok" if fields and not errors else ("partial" if fields else "blocked")
+    report = {
+        "schema_version": "1.0",
+        "operation": "COLLECT_DEAL_CONTEXT",
+        "bridge_version": BRIDGE_VERSION,
+        "bridge_contract_version": BRIDGE_CONTRACT_VERSION,
+        "status": status,
+        "started_at": started_at,
+        "finished_at": now_iso(),
+        "search_source": deal_search_source,
+        "selected_deal": selected,
+        "candidates": candidates,
+        "counts": {
+            "fields": len(fields),
+            "field_schema": len(field_schema),
+            "files": len(documents),
+            "related_entities": len(related),
+            "lazy_tabs_described": len(tabs),
+        },
+        "errors": errors,
+        "warnings": warnings,
+        "fetch_attempts": attempts,
+    }
+    write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(str(meta_dir / "run_report.json"))
+    return 0 if status == "ok" else 2
 
 
 def command_list_deals(client: BitrixSessionClient, client_contains: str | None, max_pages: int) -> int:
@@ -973,6 +1945,457 @@ def command_list_companies(client: BitrixSessionClient, name_contains: str | Non
             if needle and needle not in row["title"].lower():
                 continue
             print(f'{row["id"]}\t{row["title"]}\t{row["type"]}\t{row["url"]}')
+    return 0
+
+
+def normalized_company_name(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def is_company_card_url_for_id(
+    value: object, company_id: object, base_url: object = ""
+) -> bool:
+    parsed = urllib.parse.urlparse(str(value or "").strip())
+    base = urllib.parse.urlparse(str(base_url or "").strip())
+    expected_path = f"/crm/company/details/{str(company_id or '').strip()}/"
+    host_matches = not parsed.netloc or not base.netloc or parsed.netloc == base.netloc
+    return (
+        bool(str(company_id or "").strip())
+        and host_matches
+        and parsed.path == expected_path
+    )
+
+
+def company_card_fetch_candidates(company: dict[str, str]) -> list[str]:
+    """Prefer a saved card URL and retry every plain details URL as a side slider."""
+    company_id = str(company.get("id") or "").strip()
+    saved_url = str(company.get("url") or "").strip()
+    canonical_path = f"/crm/company/details/{company_id}/"
+    candidates: list[str] = []
+    for value in (
+        saved_url,
+        make_iframe_path(saved_url),
+        canonical_path,
+        make_iframe_path(canonical_path),
+    ):
+        if value and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def collect_company_card_income_contracts(
+    client: BitrixSessionClient,
+    company: dict[str, str],
+    max_pages: int,
+) -> dict[str, object]:
+    """Read the income-contract grid from one exact company card without files."""
+    company_id = str(company.get("id") or "").strip()
+    company_name = re.sub(r"\s+", " ", str(company.get("title") or "")).strip()
+    company_url = ""
+    company_html = ""
+    tab_candidates: list[dict[str, object]] = []
+    attempted_urls: list[str] = []
+    company_name_confirmed = False
+    ambiguous_tab_seen = False
+    for company_path in company_card_fetch_candidates(company):
+        candidate_url, candidate_html = client.fetch(company_path)
+        attempted_urls.append(candidate_url)
+        if normalized_company_name(company_name) not in normalized_company_name(
+            clean_text(candidate_html)
+        ):
+            continue
+        company_name_confirmed = True
+        candidates = [
+            tab
+            for tab in extract_tab_loaders(candidate_html)
+            if str(tab.get("id") or "") == "tab_relation_dynamic_142"
+            or "entityTypeId=142" in str(tab.get("service_url") or "")
+            or normalized_company_name(tab.get("name")) == "доходные договоры"
+        ]
+        if len(candidates) == 1:
+            company_url = candidate_url
+            company_html = candidate_html
+            tab_candidates = candidates
+            break
+        if len(candidates) > 1:
+            ambiguous_tab_seen = True
+
+    if not tab_candidates:
+        return {
+            "status": "BLOCKED",
+            "blockers": [
+                "CRM_EXACT_COMPANY_CARD_NAME_NOT_CONFIRMED"
+                if not company_name_confirmed
+                else (
+                    "CRM_COMPANY_INCOME_CONTRACT_TAB_AMBIGUOUS"
+                    if ambiguous_tab_seen
+                    else "CRM_COMPANY_INCOME_CONTRACT_TAB_NOT_FOUND"
+                )
+            ],
+            "company_card_url": attempted_urls[-1] if attempted_urls else "",
+            "company_card_attempted_urls": attempted_urls,
+            "rows": [],
+        }
+
+    tab = tab_candidates[0]
+    tab_id = str(tab.get("id") or "")
+    tab_name = re.sub(r"\s+", " ", str(tab.get("name") or "")).strip()
+    if normalized_company_name(tab_name) != "доходные договоры":
+        return {
+            "status": "BLOCKED",
+            "blockers": ["CRM_COMPANY_INCOME_CONTRACT_TAB_NAME_NOT_CONFIRMED"],
+            "company_card_url": company_url,
+            "tab_id": tab_id,
+            "rows": [],
+        }
+    service_url = str(tab.get("service_url") or "")
+    component_data = tab.get("component_data")
+    if isinstance(component_data, dict) and component_data:
+        params = dict(component_data)
+        params["TAB_ID"] = tab_id
+        fields = [("LOADER_ID", slugify(f"company-{company_id}-{tab_id}"))]
+        fields.extend(flatten_form_fields("PARAMS", params))
+        tab_url, tab_html = client.post_form(service_url, fields)
+    else:
+        tab_url, tab_html = client.fetch(service_url)
+    if 'name="form_auth"' in tab_html or not tab_html.strip():
+        return {
+            "status": "BLOCKED",
+            "blockers": ["CRM_COMPANY_INCOME_CONTRACT_TAB_UNREADABLE"],
+            "company_card_url": company_url,
+            "tab_id": tab_id,
+            "tab_url": tab_url,
+            "rows": [],
+        }
+
+    sort_url = grid_sort_url(tab_html, "Дата заключения")
+    date_sort_verified = False
+    first_url, first_html = tab_url, tab_html
+    if sort_url:
+        first_url, first_html = client.fetch(sort_url)
+        date_sort_verified = bool(first_html.strip()) and 'name="form_auth"' not in first_html
+
+    rows_by_id: dict[str, dict[str, object]] = {}
+    coverage_complete = False
+    pages_checked = 0
+    for page in range(1, max_pages + 1):
+        if page == 1:
+            page_url, page_html = first_url, first_html
+        else:
+            page_url = paged_url(first_url, page)
+            _, page_html = client.fetch(page_url)
+        pages_checked += 1
+        parsed_rows = parse_income_contract_rows(page_html)
+        if not parsed_rows:
+            coverage_complete = True
+            break
+        fresh = 0
+        for row in parsed_rows:
+            row_id = str(row.get("id") or "")
+            if not row_id or row_id in rows_by_id:
+                continue
+            fresh += 1
+            row["company_id"] = company_id
+            row["company_name"] = company_name
+            row["company_field"] = "Карточка компании"
+            row["source_tab_id"] = tab_id
+            row["source_tab_name"] = tab_name
+            row["source_url"] = page_url
+            row["source_mode"] = "COMPANY_CARD_INCOME_CONTRACTS_TAB_FALLBACK"
+            validity = row.get("validity")
+            if isinstance(validity, dict):
+                validity["source_url"] = page_url
+                validity["source_tab_id"] = tab_id
+            rows_by_id[row_id] = row
+        if fresh == 0:
+            coverage_complete = True
+            break
+
+    blockers: list[str] = []
+    if not date_sort_verified:
+        blockers.append("CRM_COMPANY_INCOME_CONTRACT_DATE_SORT_NOT_VERIFIED")
+    if not coverage_complete:
+        blockers.append("CRM_COMPANY_INCOME_CONTRACT_TAB_COVERAGE_NOT_VERIFIED")
+    if not rows_by_id:
+        blockers.append("CRM_COMPANY_INCOME_CONTRACT_ROWS_EMPTY")
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "blockers": blockers,
+        "company_id": company_id,
+        "company_name": company_name,
+        "company_card_url": company_url,
+        "company_card_attempted_urls": attempted_urls,
+        "tab_id": tab_id,
+        "tab_name": tab_name,
+        "tab_url": first_url,
+        "date_sort_verified": date_sort_verified,
+        "coverage_complete": coverage_complete,
+        "pages_checked": pages_checked,
+        "rows": list(rows_by_id.values()),
+    }
+
+
+def command_list_income_contracts(
+    client: BitrixSessionClient,
+    company_name: str,
+    max_pages: int,
+    output: str,
+    company_id: str | None = None,
+    company_card_url: str | None = None,
+) -> int:
+    """Read the canonical list, then the exact company card only on a true miss."""
+    client.login_portal()
+    initial_url, initial_html = client.fetch(INCOME_CONTRACT_LIST_PATH)
+    if 'name="form_auth"' in initial_html:
+        raise RuntimeError("Список доходных договоров вернул форму авторизации")
+
+    sort_url = grid_sort_url(initial_html, "Дата заключения")
+    date_sort_verified = False
+    first_url, first_html = initial_url, initial_html
+    if sort_url:
+        first_url, first_html = client.fetch(sort_url)
+        date_sort_verified = bool(first_html.strip()) and 'name="form_auth"' not in first_html
+
+    needle = normalized_company_name(company_name)
+    if not needle:
+        raise ValueError("Для списка доходных договоров требуется точное название компании")
+    if company_card_url and not company_id:
+        raise ValueError("--company-card-url requires --company-id")
+    if company_card_url and not is_company_card_url_for_id(
+        company_card_url, company_id, client.base_url
+    ):
+        raise ValueError(
+            "--company-card-url must point to the exact --company-id card on this CRM portal"
+        )
+
+    rows_by_id: dict[str, dict[str, object]] = {}
+    seen_row_ids: set[str] = set()
+    coverage_complete = False
+    pages_checked = 0
+    for page in range(1, max_pages + 1):
+        if page == 1:
+            page_url, page_html = first_url, first_html
+        else:
+            page_url = paged_url(first_url or INCOME_CONTRACT_LIST_PATH, page)
+            _, page_html = client.fetch(page_url)
+        pages_checked += 1
+        parsed_rows = parse_income_contract_rows(page_html)
+        if not parsed_rows:
+            coverage_complete = True
+            break
+        fresh = 0
+        for row in parsed_rows:
+            row_id = str(row.get("id") or "")
+            if not row_id or row_id in seen_row_ids:
+                continue
+            seen_row_ids.add(row_id)
+            fresh += 1
+            row_company_name = re.sub(r"\s+", " ", str(row.get("company_name") or "")).strip()
+            if row_company_name and needle == normalized_company_name(row_company_name):
+                row["source_list_url"] = INCOME_CONTRACT_LIST_URL
+                row["source_mode"] = "CANONICAL_LIST"
+                rows_by_id[row_id] = row
+        if fresh == 0:
+            coverage_complete = True
+            break
+
+    canonical_rows = list(rows_by_id.values())
+    fallback: dict[str, object] | None = None
+    if not canonical_rows and coverage_complete:
+        if company_id:
+            exact_cards = [
+                {
+                    "id": str(company_id),
+                    "title": re.sub(r"\s+", " ", company_name).strip(),
+                    "type": "",
+                    "url": company_card_url or f"/crm/company/details/{company_id}/",
+                }
+            ]
+        else:
+            exact_cards = [
+                row
+                for row in collect_company_matches(client, company_name, max_pages)
+                if normalized_company_name(row.get("title")) == needle
+            ]
+        if len(exact_cards) == 1:
+            fallback = collect_company_card_income_contracts(
+                client,
+                exact_cards[0],
+                max_pages,
+            )
+        else:
+            fallback = {
+                "status": "BLOCKED",
+                "blockers": [
+                    "CRM_EXACT_COMPANY_CARD_NOT_FOUND"
+                    if not exact_cards
+                    else "CRM_EXACT_COMPANY_CARD_AMBIGUOUS"
+                ],
+                "rows": [],
+            }
+
+    fallback_pass = bool(fallback and fallback.get("status") == "PASS")
+    rows = (
+        list(fallback.get("rows") or [])
+        if fallback_pass and fallback is not None
+        else canonical_rows
+    )
+    source_mode = (
+        "COMPANY_CARD_INCOME_CONTRACTS_TAB_FALLBACK"
+        if fallback_pass
+        else "CANONICAL_LIST"
+    )
+    payload = {
+        "schema_version": "1.2.0",
+        "tab_name": "Доходные договоры",
+        "source": {
+            "list_url": INCOME_CONTRACT_LIST_URL,
+            "mode": source_mode,
+            "final_url": (
+                fallback.get("tab_url")
+                if fallback_pass and fallback is not None
+                else first_url
+            ),
+            "canonical_list_company_found": bool(canonical_rows),
+            "canonical_list_coverage_complete": coverage_complete,
+            "fallback_attempted": fallback is not None,
+            "fallback_status": fallback.get("status") if fallback else None,
+            "fallback_reason": (
+                "COMPANY_NOT_FOUND_IN_CANONICAL_LIST" if fallback is not None else None
+            ),
+            "company_id": fallback.get("company_id") if fallback else None,
+            "company_card_url": fallback.get("company_card_url") if fallback else None,
+            "company_card_attempted_urls": (
+                fallback.get("company_card_attempted_urls")
+                if fallback
+                else []
+            ),
+            "tab_id": fallback.get("tab_id") if fallback else None,
+            "tab_name": fallback.get("tab_name") if fallback else None,
+            "tab_url": fallback.get("tab_url") if fallback else None,
+            "retrieved_at": dt.date.today().isoformat(),
+        },
+        "company_filter": company_name,
+        "company_match_verified": bool(rows) and all(
+            needle == normalized_company_name(row.get("company_name")) for row in rows
+        ),
+        "selection_hint": INCOME_CONTRACT_CHAIN_SELECTION_HINT,
+        "date_sort_verified": (
+            bool(fallback.get("date_sort_verified"))
+            if fallback_pass and fallback is not None
+            else date_sort_verified
+        ),
+        "coverage_complete": (
+            bool(fallback.get("coverage_complete"))
+            if fallback_pass and fallback is not None
+            else coverage_complete
+        ),
+        "pages_checked": (
+            fallback.get("pages_checked")
+            if fallback_pass and fallback is not None
+            else pages_checked
+        ),
+        "fallback_blockers": list(fallback.get("blockers") or []) if fallback else [],
+        "rows": rows,
+    }
+    output_path = pathlib.Path(output).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_file(output_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    print(
+        json.dumps(
+            {
+                "status": "PASS" if rows and payload["date_sort_verified"] and payload["coverage_complete"] else "BLOCKED",
+                "source_list_url": INCOME_CONTRACT_LIST_URL,
+                "source_mode": source_mode,
+                "company": company_name,
+                "rows": len(rows),
+                "date_sort_verified": payload["date_sort_verified"],
+                "coverage_complete": payload["coverage_complete"],
+                "fallback_blockers": payload["fallback_blockers"],
+                "output": str(output_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0 if rows and payload["date_sort_verified"] and payload["coverage_complete"] else 2
+
+
+def command_download_selected_income_contract(
+    client: BitrixSessionClient,
+    selection_path: str,
+    output_dir: str,
+    requested_file_url: str | None = None,
+) -> int:
+    """Download only the already selected base income-contract file."""
+
+    source = pathlib.Path(selection_path).expanduser().resolve()
+    try:
+        selection = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Не удалось прочитать selection JSON: {exc}") from exc
+    selected = selection.get("selected") if isinstance(selection, dict) else None
+    if not isinstance(selected, dict) or selection.get("status") != "PASS":
+        raise SystemExit("Скачивание разрешено только для выбранного договора со статусом PASS.")
+
+    # Команда обычно запускается отдельным CLI-процессом после чтения списка.
+    # Поэтому CookieJar в ней новый и пустой: до защищённого вложения нужна
+    # собственная авторизованная CRM-сессия, а не память предыдущей команды.
+    client.login_portal()
+
+    urls = [
+        normalize_crm_path(str(value))
+        for value in selected.get("contract_file_urls", [])
+        if normalize_crm_path(str(value))
+    ]
+    detail_url = normalize_crm_path(str(selected.get("detail_url") or ""))
+    detail_fetch_url = None
+    if not urls and detail_url:
+        detail_fetch_url, raw_html = client.fetch(detail_url)
+        urls = [normalize_crm_path(value) for value in extract_file_links(raw_html)]
+        urls = [value for value in urls if value]
+    urls = list(dict.fromkeys(urls))
+
+    chosen = normalize_crm_path(requested_file_url or "")
+    if chosen:
+        if urls and chosen not in urls:
+            raise SystemExit("Указанный --file-url отсутствует в выбранной строке/карточке договора.")
+    elif len(urls) == 1:
+        chosen = urls[0]
+    elif not urls:
+        raise SystemExit("У выбранного доходного договора не найден файл для точечного скачивания.")
+    else:
+        raise SystemExit(
+            "У выбранного доходного договора найдено несколько файлов; "
+            "просмотрите список и повторите с точным --file-url.\n" + "\n".join(urls)
+        )
+
+    final_url, body = client.fetch_binary(chosen)
+    extension = guess_extension(body, pathlib.Path(urllib.parse.urlparse(final_url).path).suffix or ".bin")
+    filename = safe_filename_from_url(final_url, f"income-contract-{selected.get('id')}{extension}")
+    if pathlib.Path(filename).suffix.casefold() not in {".docx", ".pdf", ".doc"}:
+        filename = f"income-contract-{selected.get('id')}{extension}"
+    target_dir = pathlib.Path(output_dir).expanduser().resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+    save_binary_file(target, body)
+    manifest = {
+        "schema_version": "1.0.0",
+        "status": "PASS",
+        "selection_path": str(source),
+        "selection_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "selected_contract_id": selected.get("id"),
+        "selected_detail_url": detail_url,
+        "detail_fetch_url": detail_fetch_url,
+        "source_file_url": chosen,
+        "final_file_url": final_url,
+        "file": str(target),
+        "file_sha256": hashlib.sha256(body).hexdigest(),
+        "download_scope": "SELECTED_INCOME_CONTRACT_ONLY",
+    }
+    manifest_path = target_dir / "income-contract-download.json"
+    write_text_file(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1042,6 +2465,109 @@ def collect_deal_matches(client: BitrixSessionClient, company_name: str, max_pag
     return matches
 
 
+def validate_dossier_output_dir(output_dir: str) -> pathlib.Path:
+    """Return an explicit dossier root only when it is outside every skill folder.
+
+    CRM snapshots are run-specific evidence, not skill files. Writing them below a
+    ``skills`` directory corrupts a packaged skill's integrity check and risks
+    carrying one case into the next. Keep this guard in the bridge itself so it
+    also protects callers that do not follow the master-skill instructions.
+    """
+    root_dir = pathlib.Path(output_dir).expanduser().resolve()
+    if any(parent.name == "skills" for parent in (root_dir, *root_dir.parents)):
+        raise ValueError(
+            "CRM dossier нельзя записывать внутри папки skills; "
+            "укажите отдельную папку запуска через --output-dir."
+        )
+    return root_dir
+
+
+def dossier_directory(output_dir: str, company_name: str, company_id: str | None) -> pathlib.Path:
+    root_dir = ensure_dir(validate_dossier_output_dir(output_dir))
+    company_key = company_name if company_name else f"company-{company_id}"
+    return ensure_dir(root_dir / slugify(company_key))
+
+
+def preserve_last_successful_dossier(company_dir: pathlib.Path) -> None:
+    """Keep a recoverable copy before a later run replaces a successful dossier."""
+    report_path = company_dir / "metadata" / "run_report.json"
+    if not report_path.is_file():
+        return
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if report.get("status") not in {"ok", "success", "completed"}:
+        return
+    backup_dir = ensure_dir(company_dir / "metadata" / "last-successful")
+    for relative_name in CORE_DOSSIER_FILES:
+        source = company_dir / relative_name
+        if source.is_file():
+            shutil.copy2(source, backup_dir / relative_name.replace("/", "__"))
+
+
+def write_initial_dossier_artifacts(
+    company_dir: pathlib.Path,
+    company_name: str,
+    company_id: str | None,
+    mode: str,
+) -> None:
+    """Write the minimum, honest dossier state before network traversal begins."""
+    meta_dir = ensure_dir(company_dir / "metadata")
+    run_report = {
+        "started_at": now_iso(),
+        "finished_at": "",
+        "mode": mode,
+        "company_name": company_name,
+        "company_id": company_id or "",
+        "status": "running",
+        "summary": {},
+        "checks": [],
+        "errors": [],
+        "warnings": [],
+    }
+    write_text_file(meta_dir / "run_report.json", json.dumps(run_report, ensure_ascii=False, indent=2))
+    write_text_file(meta_dir / "lazy_tabs.json", "[]\n")
+    write_text_file(meta_dir / "documents.json", "[]\n")
+    write_text_file(
+        company_dir / "context.md",
+        "# CRM dossier\n\nСбор CRM-контекста выполняется. Итоговый статус см. в `metadata/run_report.json`.\n",
+    )
+
+
+def write_failed_dossier_artifacts(
+    output_dir: str,
+    company_name: str,
+    company_id: str | None,
+    mode: str,
+    exc: Exception,
+) -> None:
+    """Leave an explicit terminal diagnostic if collection exits unexpectedly."""
+    company_dir = dossier_directory(output_dir, company_name, company_id)
+    meta_dir = ensure_dir(company_dir / "metadata")
+    for file_name in ("lazy_tabs.json", "documents.json"):
+        path = meta_dir / file_name
+        if not path.is_file():
+            write_text_file(path, "[]\n")
+    report = {
+        "started_at": "",
+        "finished_at": now_iso(),
+        "mode": mode,
+        "company_name": company_name,
+        "company_id": company_id or "",
+        "status": "failed",
+        "summary": {},
+        "checks": [],
+        "errors": [{"time": now_iso(), "kind": "unhandled_collection_error", "target": "build-company-dossier", "error": error_text(exc)}],
+        "warnings": ["Сбор остановился до финализации; raw-снимки не являются готовым CRM dossier."],
+    }
+    write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2))
+    write_text_file(
+        company_dir / "context.md",
+        "# CRM dossier\n\nСбор CRM-контекста завершился ошибкой. Использование dossier для preflight запрещено; причина зафиксирована в `metadata/run_report.json`.\n",
+    )
+
+
 def command_collect_company_context(
     client: BitrixSessionClient,
     company_name: str,
@@ -1050,15 +2576,17 @@ def command_collect_company_context(
     max_company_pages: int,
     max_deal_pages: int,
     mode: str,
+    skip_document_downloads: bool = False,
+    max_related_cards: int = DEFAULT_MAX_RELATED_CARDS,
 ) -> int:
-    root_dir = ensure_dir(pathlib.Path(output_dir) if output_dir else DEFAULT_OUTPUT_DIR)
     company_key = company_name if company_name else f"company-{company_id}"
-    company_dir = ensure_dir(root_dir / slugify(company_key))
+    company_dir = dossier_directory(output_dir, company_name, company_id)
     raw_dir = ensure_dir(company_dir / "raw")
     docs_dir = ensure_dir(company_dir / "documents")
     meta_dir = ensure_dir(company_dir / "metadata")
     disk_dir = ensure_dir(docs_dir / "bitrix_disk")
     crm_files_dir = ensure_dir(docs_dir / "crm_fields")
+    preserve_last_successful_dossier(company_dir)
     for file_name in GENERATED_METADATA_FILES:
         stale_path = meta_dir / file_name
         if stale_path.exists():
@@ -1076,6 +2604,7 @@ def command_collect_company_context(
     lazy_tab_pages: list[dict[str, str]] = []
     timeline_highlights: list[dict[str, str]] = []
     communications: list[dict[str, str]] = []
+    income_contract_rows: list[dict[str, object]] = []
     document_entrypoints: dict[str, str] = {}
     related_detail_links: list[str] = []
     document_download_limit = env_int("B24_MAX_DOCUMENT_DOWNLOADS", DEFAULT_MAX_DOCUMENT_DOWNLOADS)
@@ -1085,6 +2614,7 @@ def command_collect_company_context(
         "started_at": now_iso(),
         "finished_at": "",
         "mode": mode,
+        "document_downloads_skipped": skip_document_downloads,
         "company_name": company_name,
         "company_id": company_id or "",
         "status": "running",
@@ -1093,6 +2623,7 @@ def command_collect_company_context(
         "errors": [],
         "warnings": [],
     }
+    write_initial_dossier_artifacts(company_dir, company_name, company_id, mode)
 
     def add_check(kind: str, target: str, status: str, **extra: object) -> None:
         item: dict[str, object] = {
@@ -1136,6 +2667,7 @@ def command_collect_company_context(
             "lazy_tabs": len(lazy_tab_pages),
             "documents": len(downloaded_docs),
             "entity_links": len(entity_links),
+            "income_contract_rows": len(income_contract_rows),
             "errors": len(errors),
             "warnings": len(warnings),
         }
@@ -1154,7 +2686,7 @@ def command_collect_company_context(
         if company_id
         else collect_company_matches(client, company_name, max_company_pages)
     )
-    if company_name:
+    if company_name and mode != "package":
         for deal in collect_deal_matches(client, company_name, max_deal_pages):
             merge_deal_match(deal_matches, deal)
             merge_entity_ref(
@@ -1242,6 +2774,8 @@ def command_collect_company_context(
 
     def download_documents_from_html(source_path: str, raw_html: str) -> None:
         nonlocal document_download_limit_warned
+        if skip_document_downloads:
+            return
         for ref in extract_crm_item_file_refs(raw_html):
             name = f"{ref['field_name']}_{ref['file_id']}"
             download_url(source_path, ref["url"], crm_files_dir, name, "crm_field")
@@ -1414,6 +2948,47 @@ def command_collect_company_context(
                     "text": text_path.name,
                 }
             )
+            if source_kind == "company" and (
+                tab_id == "tab_relation_dynamic_142"
+                or "entityTypeId=142" in service_url
+            ):
+                income_html = tab_html
+                income_source_url = final_url
+                sort_url = grid_sort_url(tab_html, "Дата заключения")
+                date_sort_verified = False
+                if sort_url:
+                    try:
+                        sorted_url, sorted_html = client.fetch(sort_url)
+                        if sorted_html.strip() and 'name="form_auth"' not in sorted_html:
+                            income_html = sorted_html
+                            income_source_url = sorted_url
+                            date_sort_verified = True
+                            sorted_html_path = raw_dir / f"tab_{tab_slug}-date-ascending.html"
+                            sorted_text_path = raw_dir / f"tab_{tab_slug}-date-ascending.txt"
+                            write_text_file(sorted_html_path, sorted_html)
+                            write_text_file(sorted_text_path, clean_text(sorted_html))
+                            add_check(
+                                "income_contract_tab_sorted",
+                                sort_url,
+                                "ok",
+                                source_kind=source_kind,
+                                source_id=source_id,
+                                html=sorted_html_path.name,
+                            )
+                    except Exception as exc:
+                        add_error("income_contract_tab_sort", sort_url, exc)
+                parsed_income_rows = parse_income_contract_rows(income_html)
+                for row in parsed_income_rows:
+                    row.update(
+                        {
+                            "company_id": source_id,
+                            "source_tab_id": tab_id,
+                            "source_url": income_source_url,
+                            "date_sort_requested": bool(sort_url),
+                            "date_sort_verified": date_sort_verified,
+                        }
+                    )
+                    income_contract_rows.append(row)
             for link in extract_redirect_links(tab_html):
                 ref = classify_entity_path(link)
                 if not ref or ref.get("kind") == "deal":
@@ -1470,8 +3045,9 @@ def command_collect_company_context(
         for item in timeline_highlights
         if item.get("link") and item.get("link_text")
     }
-    for deal in collect_deal_matches_from_links(related_detail_links, title_by_related_link, company_name):
-        merge_deal_match(deal_matches, deal)
+    if mode != "package":
+        for deal in collect_deal_matches_from_links(related_detail_links, title_by_related_link, company_name):
+            merge_deal_match(deal_matches, deal)
 
     for deal in deal_matches:
         detail_path = make_iframe_path(deal["url"])
@@ -1504,10 +3080,17 @@ def command_collect_company_context(
         unique_links.append(link)
     related_detail_links = [link for link in unique_links if not extract_deal_id_from_path(link)]
 
-    if mode == "quick":
+    if mode in {"quick", "package"}:
         related_detail_links = []
 
     for index, link in enumerate(related_detail_links, start=1):
+        if index > max_related_cards:
+            add_warning(
+                "Достигнут лимит связанных CRM-карточек; dossier завершён с ограниченным охватом.",
+                limit=max_related_cards,
+                skipped=len(related_detail_links) - max_related_cards,
+            )
+            break
         try:
             fetch_path = make_iframe_path(link)
             final_url, html_body = client.fetch(fetch_path)
@@ -1574,6 +3157,30 @@ def command_collect_company_context(
         write_text_file(meta_dir / "deal_matches.json", json.dumps(deal_matches, ensure_ascii=False, indent=2))
     if entity_links:
         write_text_file(meta_dir / "entity_links.json", json.dumps(entity_links, ensure_ascii=False, indent=2))
+    if income_contract_rows:
+        deduplicated_income_rows = {
+            str(item.get("id") or ""): item
+            for item in income_contract_rows
+            if item.get("id")
+        }
+        income_contract_rows = list(deduplicated_income_rows.values())
+        write_text_file(
+            meta_dir / "income_contracts.json",
+            json.dumps(
+                {
+                    "schema_version": "1.0.0",
+                    "tab_name": "Доходные договоры",
+                    "selection_hint": INCOME_CONTRACT_CHAIN_SELECTION_HINT,
+                    "date_sort_verified": any(
+                        bool(item.get("date_sort_verified"))
+                        for item in income_contract_rows
+                    ),
+                    "rows": income_contract_rows,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
     if communications:
         save_tsv(meta_dir / "communications.tsv", communications, ["contact_id", "address_id", "type", "value_type", "value"])
     if timeline_highlights:
@@ -1582,10 +3189,8 @@ def command_collect_company_context(
         write_text_file(meta_dir / "tabs.json", json.dumps(tab_inventory, ensure_ascii=False, indent=2))
     if related_entities:
         write_text_file(meta_dir / "related_entities.json", json.dumps(related_entities, ensure_ascii=False, indent=2))
-    if lazy_tab_pages:
-        write_text_file(meta_dir / "lazy_tabs.json", json.dumps(lazy_tab_pages, ensure_ascii=False, indent=2))
-    if downloaded_docs:
-        write_text_file(meta_dir / "documents.json", json.dumps(downloaded_docs, ensure_ascii=False, indent=2))
+    write_text_file(meta_dir / "lazy_tabs.json", json.dumps(lazy_tab_pages, ensure_ascii=False, indent=2))
+    write_text_file(meta_dir / "documents.json", json.dumps(downloaded_docs, ensure_ascii=False, indent=2))
     if not saved_pages:
         add_warning("Не сохранено ни одной CRM-страницы")
     if company_matches and not any(page["kind"] == "company" for page in saved_pages):
@@ -1776,6 +3381,8 @@ def command_collect_company_context(
         lines.append("- [metadata/deal_details.json](metadata/deal_details.json) — извлеченные JSON-модели карточек сделок.")
     if (meta_dir / "entity_links.json").exists():
         lines.append("- [metadata/entity_links.json](metadata/entity_links.json) — полный реестр найденных CRM-сущностей и ссылок.")
+    if (meta_dir / "income_contracts.json").exists():
+        lines.append("- [metadata/income_contracts.json](metadata/income_contracts.json) — строки вкладки компании «Доходные договоры» с датами заключения и явными ссылками ДС на базовый договор; мастер выбирает действующую связку, покрывающую период проекта.")
     if (meta_dir / "tabs.json").exists():
         lines.append("- [metadata/tabs.json](metadata/tabs.json) — список вкладок и их внутренних loader URL.")
     if (meta_dir / "lazy_tabs.json").exists():
@@ -1822,6 +3429,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("probe")
 
+    contract_parser = subparsers.add_parser("contract")
+    contract_parser.add_argument("--output")
+
     fetch_parser = subparsers.add_parser("fetch")
     fetch_parser.add_argument("target")
     fetch_parser.add_argument(
@@ -1834,31 +3444,89 @@ def build_parser() -> argparse.ArgumentParser:
     deals_parser.add_argument("--client-contains")
     deals_parser.add_argument("--max-pages", type=int, default=50)
 
+    deal_lookup_parser = subparsers.add_parser("find-deal-by-project-number")
+    deal_lookup_parser.add_argument("--project-number", required=True)
+    deal_lookup_parser.add_argument("--output", required=True)
+
+    deal_context_parser = subparsers.add_parser("collect-deal-context")
+    deal_context_input = deal_context_parser.add_mutually_exclusive_group(required=True)
+    deal_context_input.add_argument("--project-number")
+    deal_context_input.add_argument("--deal-id")
+    deal_context_input.add_argument("--deal-url")
+    deal_context_parser.add_argument("--output-dir", required=True)
+    deal_context_parser.add_argument("--skip-document-downloads", action="store_true")
+
+    entity_context_parser = subparsers.add_parser("collect-entity-context")
+    entity_context_parser.add_argument("--entity-url", required=True)
+    entity_context_parser.add_argument("--expected-kind", choices=("contact", "company", "deal", "dynamic", "lead", "quote", "smart_invoice"))
+    entity_context_parser.add_argument("--output-dir", required=True)
+
+    chat_resolution_parser = subparsers.add_parser("record-deal-chat-resolution")
+    chat_resolution_parser.add_argument("--deal-search-report", required=True)
+    chat_resolution_parser.add_argument("--chat-url", required=True)
+    chat_resolution_parser.add_argument("--chat-header", required=True)
+    chat_resolution_parser.add_argument("--open-deal-url", required=True)
+    chat_resolution_parser.add_argument("--resolved-tax-status", required=True, choices=("SMZ", "IP", "FL"))
+    chat_resolution_parser.add_argument("--message-locator", action="append", required=True)
+    chat_resolution_parser.add_argument("--message-text", required=True)
+    chat_resolution_parser.add_argument("--reviewed-at", required=True)
+    chat_resolution_parser.add_argument("--output", required=True)
+
     companies_parser = subparsers.add_parser("list-companies")
     companies_parser.add_argument("--name-contains")
     companies_parser.add_argument("--max-pages", type=int, default=50)
 
+    income_contracts_parser = subparsers.add_parser("list-income-contracts")
+    income_contracts_parser.add_argument("--company", required=True)
+    income_contracts_parser.add_argument("--company-id")
+    income_contracts_parser.add_argument("--company-card-url")
+    income_contracts_parser.add_argument("--max-pages", type=int, default=50)
+    income_contracts_parser.add_argument("--output", required=True)
+
+    income_contract_download_parser = subparsers.add_parser("download-selected-income-contract")
+    income_contract_download_parser.add_argument("--selection", required=True)
+    income_contract_download_parser.add_argument("--output-dir", required=True)
+    income_contract_download_parser.add_argument("--file-url")
+
     collect_parser = subparsers.add_parser("collect-company-context")
     collect_parser.add_argument("company_name", nargs="?", default="")
     collect_parser.add_argument("--company-id")
-    collect_parser.add_argument("--output-dir")
+    collect_parser.add_argument("--output-dir", required=True)
     collect_parser.add_argument("--max-company-pages", type=int, default=50)
     collect_parser.add_argument("--max-deal-pages", type=int, default=50)
+    collect_parser.add_argument("--max-related-cards", type=int, default=DEFAULT_MAX_RELATED_CARDS)
     collect_parser.add_argument("--mode", choices=COLLECT_MODES, default="full")
+    collect_parser.add_argument("--skip-document-downloads", action="store_true")
 
     dossier_parser = subparsers.add_parser("build-company-dossier")
     dossier_parser.add_argument("company_name", nargs="?", default="")
     dossier_parser.add_argument("--company-id")
-    dossier_parser.add_argument("--output-dir")
+    dossier_parser.add_argument("--output-dir", required=True)
     dossier_parser.add_argument("--max-company-pages", type=int, default=50)
     dossier_parser.add_argument("--max-deal-pages", type=int, default=50)
+    dossier_parser.add_argument("--max-related-cards", type=int, default=DEFAULT_MAX_RELATED_CARDS)
     dossier_parser.add_argument("--mode", choices=COLLECT_MODES, default="full")
+    dossier_parser.add_argument("--skip-document-downloads", action="store_true")
     return parser
 
 
 def main() -> int:
     load_env_file(ENV_PATH)
     args = build_parser().parse_args()
+    if args.command == "contract":
+        return command_contract(args.output)
+    if args.command == "record-deal-chat-resolution":
+        return command_record_deal_chat_resolution(
+            args.deal_search_report,
+            args.chat_url,
+            args.chat_header,
+            args.open_deal_url,
+            args.resolved_tax_status,
+            args.message_locator,
+            args.message_text,
+            args.reviewed_at,
+            args.output,
+        )
     client = BitrixSessionClient(
         env_required("B24_BASE_URL"),
         env_required("B24_LOGIN"),
@@ -1870,18 +3538,65 @@ def main() -> int:
         return command_fetch(client, args.target, args.format)
     if args.command == "list-deals":
         return command_list_deals(client, args.client_contains, args.max_pages)
+    if args.command == "find-deal-by-project-number":
+        return command_find_deal_by_project_number(client, args.project_number, args.output)
+    if args.command == "collect-deal-context":
+        return command_collect_deal_context(
+            client,
+            args.output_dir,
+            args.project_number,
+            args.deal_id,
+            args.deal_url,
+            args.skip_document_downloads,
+        )
+    if args.command == "collect-entity-context":
+        return command_collect_entity_context(
+            client,
+            args.output_dir,
+            args.entity_url,
+            args.expected_kind,
+        )
     if args.command == "list-companies":
         return command_list_companies(client, args.name_contains, args.max_pages)
-    if args.command in {"collect-company-context", "build-company-dossier"}:
-        return command_collect_company_context(
+    if args.command == "list-income-contracts":
+        return command_list_income_contracts(
             client,
-            args.company_name,
+            args.company,
+            args.max_pages,
+            args.output,
             args.company_id,
-            args.output_dir,
-            args.max_company_pages,
-            args.max_deal_pages,
-            args.mode,
+            args.company_card_url,
         )
+    if args.command == "download-selected-income-contract":
+        return command_download_selected_income_contract(
+            client,
+            args.selection,
+            args.output_dir,
+            args.file_url,
+        )
+    if args.command in {"collect-company-context", "build-company-dossier"}:
+        validate_dossier_output_dir(args.output_dir)
+        try:
+            return command_collect_company_context(
+                client,
+                args.company_name,
+                args.company_id,
+                args.output_dir,
+                args.max_company_pages,
+                args.max_deal_pages,
+                args.mode,
+                args.skip_document_downloads,
+                args.max_related_cards,
+            )
+        except Exception as exc:
+            write_failed_dossier_artifacts(
+                args.output_dir,
+                args.company_name,
+                args.company_id,
+                args.mode,
+                exc,
+            )
+            raise
     raise SystemExit("Неизвестная команда")
 
 
