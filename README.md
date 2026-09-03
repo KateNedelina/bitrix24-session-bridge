@@ -75,6 +75,13 @@ B24_PASSWORD=your-password
 python3 scripts/bitrix24_session_client.py probe
 ```
 
+Без учетных данных можно проверить состав установленного skill и его read-only
+контракт:
+
+```bash
+python3 scripts/quick_validate.py --skill-dir .
+```
+
 4. Соберите dossier по компании:
 
 ```bash
@@ -246,7 +253,8 @@ bitrix24_company_contexts/
 ├── SKILL.md
 ├── .env.example
 └── scripts/
-    └── bitrix24_session_client.py
+    ├── bitrix24_session_client.py
+    └── quick_validate.py
 ```
 
 Не публикуемые локальные файлы:

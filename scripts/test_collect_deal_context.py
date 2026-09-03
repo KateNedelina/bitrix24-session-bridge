@@ -160,12 +160,12 @@ class CollectDealContextTests(unittest.TestCase):
     def test_standard_title_has_schema_metadata_and_empty_editor_field_is_exported(self):
         html = """<script>BX.editor({current: [{'name':'UF_EMPTY','type':'string','title':'Пустое поле',
         'data':{'fieldInfo':{'USER_TYPE_ID':'string','MULTIPLE':'N'}}}]});</script>"""
-        schema = bridge.extract_field_schema(html, {"TITLE": "4668: Synthetic"})
+        schema = bridge.extract_field_schema(html, {"TITLE": "1234: Synthetic"})
         self.assertEqual(schema["TITLE"]["field_title"], "Название")
         self.assertEqual(schema["TITLE"]["metadata_source"], "STANDARD_BITRIX_FIELD_SCHEMA")
         self.assertIn("UF_EMPTY", schema)
         fields = bridge.build_field_records(
-            schema, {"TITLE": "4668: Synthetic"}, entity_type="deal", entity_type_id="2", entity_id="1",
+            schema, {"TITLE": "1234: Synthetic"}, entity_type="deal", entity_type_id="2", entity_id="1",
             source_url="https://crm.example.test/crm/deal/details/1/", read_at="2030-01-01T00:00:00+00:00",
             retrieval_method="TEST",
         )
