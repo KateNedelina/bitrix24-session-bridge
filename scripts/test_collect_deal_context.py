@@ -93,6 +93,13 @@ class FolderClient(FakeClient):
         return target, b"\x89PNG\r\n\x1a\nsynthetic"
 
 
+class ReferenceRendererClient:
+    def post_form(self, target, fields):
+        self.target = target
+        self.fields = fields
+        return target, json.dumps({"FIELD": {"UF_REFERENCE": {"HTML": '<span data-id="7">Visible value</span>'}}})
+
+
 class CollectDealContextTests(unittest.TestCase):
     def test_direct_deal_id_writes_machine_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -195,6 +202,23 @@ class CollectDealContextTests(unittest.TestCase):
 
     def test_unknown_zip_is_not_mislabeled_as_docx(self):
         self.assertEqual(bridge.guess_extension(b"PK\x03\x04"), ".zip")
+
+    def test_iblock_display_value_uses_authenticated_view_renderer(self):
+        client = ReferenceRendererClient()
+        raw_html = '"bitrix_sessid":"abc123" "UF_SITE_TPL":"bitrix24" "UF_SITE_TPL_SIGN":"def456"'
+        values, warnings = bridge.resolve_reference_display_values(
+            client,
+            raw_html,
+            {"UF_REFERENCE": {"field_type": "iblock_element", "settings": {
+                "USER_TYPE_ID": "iblock_element", "ENTITY_ID": "CRM_DEAL", "ENTITY_VALUE_ID": "1",
+                "FIELD": "UF_REFERENCE", "MULTIPLE": "N", "SETTINGS": {"IBLOCK_ID": "50"},
+            }}},
+            {"UF_REFERENCE": {"VALUE": "7", "SIGNATURE": "signature"}},
+        )
+        self.assertEqual(values, {"UF_REFERENCE": "Visible value"})
+        self.assertEqual(warnings, [])
+        self.assertEqual(client.target, "/bitrix/tools/uf.php")
+        self.assertIn(("mode", "main.view"), client.fields)
 
     def test_existing_commands_remain_registered(self):
         parser = bridge.build_parser()

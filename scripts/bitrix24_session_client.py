@@ -1058,6 +1058,105 @@ def normalized_field_value(value: object, schema: dict[str, object]) -> str:
     return value_from_signed_field(value)
 
 
+def user_field_view_context(raw_html: str) -> dict[str, str] | None:
+    """Extract the per-card anti-forgery context used by Bitrix's view renderer."""
+    sessid = re.search(r'"bitrix_sessid":"(?P<value>[a-f0-9]+)"', raw_html)
+    site_tpl = re.search(r'"UF_SITE_TPL":"(?P<value>[^"]+)"', raw_html)
+    site_tpl_sign = re.search(r'"UF_SITE_TPL_SIGN":"(?P<value>[a-f0-9]+)"', raw_html)
+    if not sessid or not site_tpl or not site_tpl_sign:
+        return None
+    return {
+        "sessid": sessid.group("value"),
+        "tpl": site_tpl.group("value"),
+        "tpls": site_tpl_sign.group("value"),
+    }
+
+
+def append_form_value(fields: list[tuple[str, str]], key: str, value: object) -> None:
+    """Encode a nested Bitrix user-field request without inventing values."""
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            append_form_value(fields, f"{key}[{child_key}]", child_value)
+    elif isinstance(value, list):
+        for index, child_value in enumerate(value):
+            append_form_value(fields, f"{key}[{index}]", child_value)
+    elif value is not None:
+        fields.append((key, str(value)))
+
+
+def resolve_reference_display_values(
+    client: "BitrixSessionClient",
+    raw_html: str,
+    schema: dict[str, dict[str, object]],
+    raw_fields: dict[str, object],
+) -> tuple[dict[str, str], list[str]]:
+    """Render iblock references through Bitrix's authenticated *view* endpoint.
+
+    The embedded CRM model stores only an iblock element/section ID.  The same
+    read-only renderer that the card uses provides the visible label, so the
+    bridge never treats an internal numeric ID as the business value.
+    """
+    context = user_field_view_context(raw_html)
+    candidates: list[tuple[str, dict[str, object], object]] = []
+    for code, definition in schema.items():
+        if str(definition.get("field_type") or "").casefold() not in {"iblock_element", "iblock_section"}:
+            continue
+        raw_value = raw_fields.get(code)
+        if value_from_signed_field(raw_value).strip():
+            candidates.append((code, definition, raw_value))
+    if not candidates:
+        return {}, []
+    if context is None:
+        return {}, ["REFERENCE_DISPLAY_RENDER_CONTEXT_UNAVAILABLE"]
+
+    form: list[tuple[str, str]] = [
+        ("mode", "main.view"),
+        ("lang", "ru"),
+        ("tpl", context["tpl"]),
+        ("tpls", context["tpls"]),
+        ("sessid", context["sessid"]),
+        ("FORM", "bitrix24-session-bridge-read-only"),
+        ("CONTEXT", "UI_EDITOR"),
+    ]
+    requested_codes: list[str] = []
+    for index, (code, definition, raw_value) in enumerate(candidates):
+        settings = definition.get("settings") if isinstance(definition.get("settings"), dict) else {}
+        if not settings:
+            continue
+        for key, value in settings.items():
+            append_form_value(form, f"FIELDS[{index}][{key}]", value)
+        if isinstance(raw_value, dict):
+            signature = raw_value.get("SIGNATURE")
+            value = raw_value.get("VALUE")
+        else:
+            signature = None
+            value = raw_value
+        if signature:
+            form.append((f"FIELDS[{index}][SIGNATURE]", str(signature)))
+        append_form_value(form, f"FIELDS[{index}][VALUE]", value)
+        requested_codes.append(code)
+    if not requested_codes:
+        return {}, ["REFERENCE_DISPLAY_RENDER_FIELDS_UNAVAILABLE"]
+
+    try:
+        _, body = client.post_form("/bitrix/tools/uf.php", form)
+        payload = json.loads(body)
+    except Exception as exc:
+        return {}, [f"REFERENCE_DISPLAY_RENDER_FAILED:{type(exc).__name__}"]
+    fields_payload = payload.get("FIELD") if isinstance(payload, dict) else None
+    if not isinstance(fields_payload, dict):
+        return {}, ["REFERENCE_DISPLAY_RENDER_RESPONSE_INVALID"]
+    values: dict[str, str] = {}
+    for code in requested_codes:
+        item = fields_payload.get(code)
+        rendered_html = item.get("HTML") if isinstance(item, dict) else None
+        rendered = clean_text(str(rendered_html or ""))
+        if rendered:
+            values[code] = rendered
+    missing = sorted(set(requested_codes) - set(values))
+    return values, [f"REFERENCE_DISPLAY_RENDER_EMPTY:{code}" for code in missing]
+
+
 def build_field_records(
     schema: dict[str, dict[str, object]],
     raw_fields: dict[str, object],
@@ -1068,13 +1167,16 @@ def build_field_records(
     source_url: str,
     read_at: str,
     retrieval_method: str,
+    resolved_display_values: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     """Emit every registered field, including editor-declared empty fields."""
     records: list[dict[str, object]] = []
+    resolved_display_values = resolved_display_values or {}
     for code in sorted(schema):
         definition = schema[code]
         raw_value = raw_fields.get(code)
-        normalized = normalized_field_value(raw_value, definition)
+        rendered_display = resolved_display_values.get(code)
+        normalized = rendered_display or normalized_field_value(raw_value, definition)
         records.append({
             "field_code": code,
             "field_name": code,
@@ -1087,7 +1189,8 @@ def build_field_records(
             "option_list_version": definition.get("option_list_version"),
             "raw_value": raw_value,
             "normalized_value": normalized,
-            "display_value": display_value_from_field(raw_value, definition),
+            "display_value": rendered_display or display_value_from_field(raw_value, definition),
+            "display_retrieval_method": "AUTHENTICATED_USER_FIELD_VIEW_RENDERER" if rendered_display else None,
             "entity_type": entity_type,
             "entity_type_id": entity_type_id,
             "entity_id": entity_id,
@@ -1809,12 +1912,14 @@ def command_collect_entity_context(
     else:
         raw_fields = dict(matches[0]["data"])
     schema = extract_field_schema(raw_html, raw_fields)
+    resolved_display_values, display_warnings = resolve_reference_display_values(client, raw_html, schema, raw_fields)
     read_at = now_iso()
     fields = build_field_records(
         schema, raw_fields,
         entity_type=str(ref["kind"]), entity_type_id=expected_type_id,
         entity_id=expected_id, source_url=final_url, read_at=read_at,
         retrieval_method="AUTHENTICATED_ENTITY_CARD_EMBEDDED_MODEL",
+        resolved_display_values=resolved_display_values,
     )
     entity = {
         "schema_version": "1.0",
@@ -1846,6 +1951,7 @@ def command_collect_entity_context(
         "counts": {"fields": len(fields), "field_schema": len(schema), "related_entities": len(related_entities)},
         "fetch_attempts": attempts,
         "errors": errors,
+        "warnings": display_warnings,
         "started_at": started_at,
         "finished_at": now_iso(),
     }
@@ -2158,11 +2264,14 @@ def command_collect_deal_context(
 
     read_at = now_iso()
     field_schema = extract_field_schema(raw_html, raw_fields)
+    resolved_display_values, display_warnings = resolve_reference_display_values(client, raw_html, field_schema, raw_fields)
+    warnings.extend(display_warnings)
     fields = build_field_records(
         field_schema, raw_fields,
         entity_type="deal", entity_type_id="2", entity_id=deal_id_value,
         source_url=final_url, read_at=read_at,
         retrieval_method="AUTHENTICATED_DEAL_CARD_EMBEDDED_MODEL",
+        resolved_display_values=resolved_display_values,
     )
     file_refs = extract_crm_item_file_refs(raw_html)
     direct_file_links = extract_file_links(raw_html)
