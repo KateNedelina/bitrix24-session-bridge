@@ -154,6 +154,15 @@ python3 scripts/bitrix24_session_client.py list-companies \
   --name-contains 'Название клиента'
 ```
 
+Собрать полный связанный список точного типа из карточки контакта:
+
+```bash
+python3 scripts/bitrix24_session_client.py collect-contact-related-list \
+  --contact-url 'https://crm.example/crm/contact/details/200/' \
+  --related-entity-type-id 130 \
+  --output-dir ./contact-related-list
+```
+
 Собрать контекст по названию компании:
 
 ```bash

@@ -242,6 +242,23 @@ entity type и ID из переданного URL. Она предназначе
 стандартных полей сохраняются стабильные code/title/type metadata. Бизнес-правила
 остаются у потребителя.
 
+Собрать полный связанный список одного типа из точной карточки контакта:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/bitrix24-session-bridge/scripts/bitrix24_session_client.py" \
+  collect-contact-related-list \
+  --contact-url 'https://crm.example/crm/contact/details/200/' \
+  --related-entity-type-id 130 \
+  --output-dir '<run>/crm-performer-role-history'
+```
+
+Команда выбирает вкладку только по точной тройке `entityTypeId`,
+`parentEntityTypeId=3`, `parentEntityId=<ID контакта>`, подтверждает общее число
+строк через штатный read-only count endpoint и собирает точную карточку каждого
+связанного элемента. В `metadata/related_items.json` сохраняются исходные поля,
+полнота и идентичность контакта. Мост не решает, является ли запись прежним
+привлечением, и не сопоставляет названия ролей со ставками: это правило Контролера.
+
 Собрать полный инвентарь одной точной папки проекта Bitrix Disk:
 
 ```bash

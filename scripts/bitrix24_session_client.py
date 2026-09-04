@@ -34,8 +34,8 @@ from typing import Iterable
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parents[1]
 ENV_PATH = SKILL_DIR / ".env"
-BRIDGE_VERSION = "0.3.0-candidate"
-BRIDGE_CONTRACT_VERSION = "1.1"
+BRIDGE_VERSION = "0.3.1-candidate"
+BRIDGE_CONTRACT_VERSION = "1.2"
 BRIDGE_CAPABILITIES = (
     "deal_outer_and_side_slider_fetch",
     "exact_deal_model_selection",
@@ -47,6 +47,7 @@ BRIDGE_CAPABILITIES = (
     "standard_field_schema",
     "reference_display_value_resolution",
     "project_folder_inventory",
+    "exact_contact_related_list_collection",
     "read_only_collection",
 )
 COLLECT_MODES = ("quick", "package", "full", "deep")
@@ -513,6 +514,65 @@ def main_grid_headers(raw_html: str) -> list[dict[str, str]]:
         if name_match and title_match:
             headers.append({"name": name_match.group(1), "title": strip_tags(title_match.group(1))})
     return headers
+
+
+def parse_main_grid_records(raw_html: str) -> list[dict[str, object]]:
+    """Map generic Bitrix main-grid rows to stable column codes and titles."""
+    headers = main_grid_headers(raw_html)
+    parser = MainGridRowParser()
+    parser.feed(raw_html)
+    records: list[dict[str, object]] = []
+    for parsed in parser.rows:
+        row_id = str(parsed.get("id") or "")
+        cells = parsed.get("cells")
+        if not row_id.isdigit() or not isinstance(cells, list) or len(cells) < len(headers):
+            continue
+        offset = len(cells) - len(headers)
+        columns: list[dict[str, object]] = []
+        for index, header in enumerate(headers):
+            cell = cells[offset + index]
+            if not isinstance(cell, dict):
+                cell = {}
+            columns.append({
+                "field_code": header["name"],
+                "field_title": header["title"],
+                "value": str(cell.get("text") or "").strip(),
+                "links": list(cell.get("links") or []),
+                "data_srcs": list(cell.get("data_srcs") or []),
+            })
+        records.append({"id": row_id, "columns": columns})
+    return records
+
+
+def related_list_total_count_url(raw_html: str) -> str:
+    match = re.search(
+        r"Extension\.getCountRow\(\s*['\"][^'\"]+['\"]\s*,\s*['\"](?P<url>[^'\"]+)['\"]",
+        raw_html,
+        re.S,
+    )
+    return html.unescape(match.group("url")) if match else ""
+
+
+def parse_related_list_total_count(raw_json: str) -> int | None:
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    text = payload.get("DATA", {}).get("TEXT") if isinstance(payload, dict) else None
+    match = re.search(r"(\d+)", str(text or ""))
+    return int(match.group(1)) if match else None
+
+
+def related_ids_from_count_url(count_url: str) -> list[str]:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(count_url).query)
+    identifiers: list[str] = []
+    for key, values in query.items():
+        if not key.startswith("listFilter[@ID]"):
+            continue
+        for value in values:
+            if value.isdigit() and value not in identifiers:
+                identifiers.append(value)
+    return identifiers
 
 
 def grid_sort_url(raw_html: str, header_title: str) -> str:
@@ -1829,6 +1889,7 @@ def command_contract(output: str | None) -> int:
         "commands": [
             "collect-deal-context",
             "collect-entity-context",
+            "collect-contact-related-list",
             "collect-project-folder",
             "collect-company-context",
             "list-income-contracts",
@@ -1848,6 +1909,7 @@ def command_collect_entity_context(
     output_dir: str,
     entity_url: str,
     expected_kind: str | None,
+    emit_result: bool = True,
 ) -> int:
     """Collect one explicitly selected CRM entity; never search for a substitute."""
     root = pathlib.Path(output_dir).expanduser().resolve()
@@ -1956,8 +2018,202 @@ def command_collect_entity_context(
         "finished_at": now_iso(),
     }
     write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-    print(str(meta_dir / "run_report.json"))
+    if emit_result:
+        print(str(meta_dir / "run_report.json"))
     return 0 if status == "ok" else 2
+
+
+def command_collect_contact_related_list(
+    client: BitrixSessionClient,
+    output_dir: str,
+    contact_url: str,
+    related_entity_type_id: str,
+    max_items: int,
+) -> int:
+    """Collect one complete related dynamic list from one exact contact card.
+
+    The bridge proves transport identity and completeness only. Interpretation
+    of the related records (for example, whether a role is historical) remains
+    the downstream consumer's responsibility.
+    """
+    root = pathlib.Path(output_dir).expanduser().resolve()
+    raw_dir = ensure_dir(root / "raw")
+    meta_dir = ensure_dir(root / "metadata")
+    item_contexts = ensure_dir(root / "items")
+    started_at = now_iso()
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    parsed = urllib.parse.urlparse(contact_url)
+    contact_ref = classify_entity_path(parsed.path)
+    if contact_ref is None or contact_ref.get("kind") != "contact":
+        errors.append("CONTACT_URL_INVALID")
+    if not str(related_entity_type_id).isdigit():
+        errors.append("RELATED_ENTITY_TYPE_ID_INVALID")
+    if max_items < 1:
+        errors.append("MAX_ITEMS_INVALID")
+
+    contact_context = root / "contact-context"
+    if not errors:
+        code = command_collect_entity_context(
+            client,
+            str(contact_context),
+            contact_url,
+            "contact",
+            emit_result=False,
+        )
+        if code != 0:
+            errors.append("CONTACT_CONTEXT_NOT_COLLECTED")
+
+    contact_entity_path = contact_context / "metadata" / "entity.json"
+    contact_entity = (
+        json.loads(contact_entity_path.read_text(encoding="utf-8"))
+        if contact_entity_path.is_file()
+        else {}
+    )
+    contact_id = str(contact_entity.get("entity_id") or "")
+    card_path = contact_context / "raw" / (
+        "entity-iframe.html" if "IFRAME=Y" in str(contact_entity.get("source_url") or "") else "entity-outer.html"
+    )
+    card_html = card_path.read_text(encoding="utf-8") if card_path.is_file() else ""
+    matching_tabs: list[dict[str, object]] = []
+    if not errors:
+        for tab in extract_tab_loaders(card_html):
+            service_url = str(tab.get("service_url") or "")
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(service_url).query)
+            if (
+                query.get("entityTypeId") == [str(related_entity_type_id)]
+                and query.get("parentEntityTypeId") == ["3"]
+                and query.get("parentEntityId") == [contact_id]
+            ):
+                matching_tabs.append(tab)
+        if len(matching_tabs) != 1:
+            errors.append("CONTACT_RELATED_LIST_TAB_NOT_UNIQUE")
+
+    list_html = ""
+    list_url = ""
+    grid_records: list[dict[str, object]] = []
+    count_url = ""
+    total_count: int | None = None
+    relation_ids: list[str] = []
+    if not errors:
+        tab = matching_tabs[0]
+        component_data = tab.get("component_data")
+        params = dict(component_data) if isinstance(component_data, dict) else {}
+        params["TAB_ID"] = str(tab.get("id") or "")
+        fields = [("LOADER_ID", slugify(f"contact-{contact_id}-related-{related_entity_type_id}"))]
+        fields.extend(flatten_form_fields("PARAMS", params))
+        try:
+            list_url, list_html = client.post_form(str(tab.get("service_url") or ""), fields)
+            write_text_file(raw_dir / f"related-{related_entity_type_id}-list.html", list_html)
+        except Exception as exc:
+            errors.append(f"CONTACT_RELATED_LIST_FETCH_FAILED:{error_text(exc)}")
+        if not list_html.strip() or 'name="form_auth"' in list_html:
+            errors.append("CONTACT_RELATED_LIST_RESPONSE_INVALID")
+
+    if list_html:
+        grid_records = parse_main_grid_records(list_html)
+        count_url = related_list_total_count_url(list_html)
+        if not count_url:
+            errors.append("CONTACT_RELATED_LIST_TOTAL_URL_NOT_FOUND")
+        else:
+            try:
+                _, count_body = client.fetch(count_url)
+                write_text_file(raw_dir / f"related-{related_entity_type_id}-count.json", count_body)
+                total_count = parse_related_list_total_count(count_body)
+            except Exception as exc:
+                errors.append(f"CONTACT_RELATED_LIST_COUNT_FAILED:{error_text(exc)}")
+            relation_ids = related_ids_from_count_url(count_url)
+        if total_count is None:
+            errors.append("CONTACT_RELATED_LIST_TOTAL_NOT_CONFIRMED")
+        elif total_count != len(relation_ids):
+            errors.append("CONTACT_RELATED_LIST_RELATION_IDS_INCOMPLETE")
+        visible_ids = {str(record.get("id") or "") for record in grid_records}
+        if not visible_ids.issubset(set(relation_ids)):
+            errors.append("CONTACT_RELATED_LIST_GRID_ID_MISMATCH")
+        if len(relation_ids) > max_items:
+            errors.append("CONTACT_RELATED_LIST_LIMIT_REACHED")
+
+    records_by_id = {str(record.get("id") or ""): record for record in grid_records}
+    items: list[dict[str, object]] = []
+    if not errors:
+        for item_id in relation_ids:
+            item_root = item_contexts / f"dynamic-{related_entity_type_id}-{item_id}"
+            item_url = urllib.parse.urljoin(
+                str(contact_entity.get("source_url") or contact_url),
+                f"/crm/type/{related_entity_type_id}/details/{item_id}/",
+            )
+            code = command_collect_entity_context(
+                client,
+                str(item_root),
+                item_url,
+                "dynamic",
+                emit_result=False,
+            )
+            if code != 0:
+                errors.append(f"CONTACT_RELATED_ITEM_NOT_COLLECTED:{item_id}")
+                continue
+            item_entity = json.loads((item_root / "metadata" / "entity.json").read_text(encoding="utf-8"))
+            item_fields = json.loads((item_root / "metadata" / "fields.json").read_text(encoding="utf-8"))
+            items.append({
+                "id": item_id,
+                "entity": item_entity,
+                "fields": item_fields if isinstance(item_fields, list) else [],
+                "grid_record": records_by_id.get(item_id),
+                "context_path": str(item_root.relative_to(root)),
+            })
+
+    complete = (
+        not errors
+        and total_count is not None
+        and total_count == len(relation_ids) == len(items)
+    )
+    payload = {
+        "schema_version": "1.0",
+        "status": "PASS" if complete else "BLOCKED",
+        "contact": {
+            "entity_type": "contact",
+            "entity_type_id": "3",
+            "entity_id": contact_id,
+            "source_url": contact_entity.get("source_url"),
+            "read_at": contact_entity.get("read_at"),
+        },
+        "related_entity_type_id": str(related_entity_type_id),
+        "source_tab": {
+            "id": matching_tabs[0].get("id") if len(matching_tabs) == 1 else None,
+            "name": matching_tabs[0].get("name") if len(matching_tabs) == 1 else None,
+            "response_url": list_url,
+        },
+        "coverage": {
+            "complete": complete,
+            "total_count": total_count,
+            "relation_ids": relation_ids,
+            "grid_rows_collected": len(grid_records),
+            "exact_item_cards_collected": len(items),
+            "max_items": max_items,
+        },
+        "items": items,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    write_text_file(meta_dir / "related_items.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    report = {
+        "schema_version": "1.0",
+        "operation": "COLLECT_CONTACT_RELATED_LIST",
+        "status": "ok" if complete else "blocked",
+        "bridge_version": BRIDGE_VERSION,
+        "bridge_contract_version": BRIDGE_CONTRACT_VERSION,
+        "contact_id": contact_id,
+        "related_entity_type_id": str(related_entity_type_id),
+        "coverage": payload["coverage"],
+        "errors": errors,
+        "warnings": warnings,
+        "started_at": started_at,
+        "finished_at": now_iso(),
+    }
+    write_text_file(meta_dir / "run_report.json", json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(str(meta_dir / "run_report.json"))
+    return 0 if complete else 2
 
 
 def command_collect_project_folder(
@@ -3926,6 +4182,12 @@ def build_parser() -> argparse.ArgumentParser:
     entity_context_parser.add_argument("--expected-kind", choices=("contact", "company", "deal", "dynamic", "lead", "quote", "smart_invoice"))
     entity_context_parser.add_argument("--output-dir", required=True)
 
+    related_list_parser = subparsers.add_parser("collect-contact-related-list")
+    related_list_parser.add_argument("--contact-url", required=True)
+    related_list_parser.add_argument("--related-entity-type-id", required=True)
+    related_list_parser.add_argument("--output-dir", required=True)
+    related_list_parser.add_argument("--max-items", type=int, default=200)
+
     project_folder_parser = subparsers.add_parser("collect-project-folder")
     project_folder_parser.add_argument("--folder-url", required=True)
     project_folder_parser.add_argument("--output-dir", required=True)
@@ -4026,6 +4288,14 @@ def main() -> int:
             args.output_dir,
             args.entity_url,
             args.expected_kind,
+        )
+    if args.command == "collect-contact-related-list":
+        return command_collect_contact_related_list(
+            client,
+            args.output_dir,
+            args.contact_url,
+            args.related_entity_type_id,
+            args.max_items,
         )
     if args.command == "collect-project-folder":
         return command_collect_project_folder(

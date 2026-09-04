@@ -32,7 +32,12 @@ def main() -> int:
     except json.JSONDecodeError:
         contract = {}
     check(contract_result.returncode == 0 and contract.get("read_only") is True, "read_only_contract", failures)
-    required = {"field_schema_export", "reference_display_value_resolution", "project_folder_inventory"}
+    required = {
+        "field_schema_export",
+        "reference_display_value_resolution",
+        "project_folder_inventory",
+        "exact_contact_related_list_collection",
+    }
     check(required <= set(contract.get("capabilities", [])), "contract_capabilities", failures)
     return 0 if not failures else 2
 
