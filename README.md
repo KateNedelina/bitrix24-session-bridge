@@ -47,6 +47,12 @@
 - документы из CRM user-field файлов, прямых ссылок и Bitrix Disk папок;
 - машинные метаданные и человекочитаемый `context.md`.
 
+Для Controller доступна отдельная строго read-only команда
+`collect-project-folder`: она фиксирует полный доступный инвентарь одной точной
+папки проекта в `project-folder-files.json`, включая вложенные папки, страницы,
+MIME/расширения, URL, время чтения и SHA-256 только для явно запрошенных файлов.
+Она не выбирает бизнес-документ по имени и не выполняет записи в CRM или Disk.
+
 ## Быстрый старт
 
 1. Скопируйте пример окружения:
@@ -67,6 +73,13 @@ B24_PASSWORD=your-password
 
 ```bash
 python3 scripts/bitrix24_session_client.py probe
+```
+
+Без учетных данных можно проверить состав установленного skill и его read-only
+контракт:
+
+```bash
+python3 scripts/quick_validate.py --skill-dir .
 ```
 
 4. Соберите dossier по компании:
@@ -108,7 +121,7 @@ python3 scripts/bitrix24_session_client.py probe
 
 ```bash
 python3 scripts/bitrix24_session_client.py fetch \
-  /crm/deal/details/14325/ \
+  "/crm/deal/details/${DEAL_ID}/" \
   --format text
 ```
 
@@ -240,7 +253,8 @@ bitrix24_company_contexts/
 ├── SKILL.md
 ├── .env.example
 └── scripts/
-    └── bitrix24_session_client.py
+    ├── bitrix24_session_client.py
+    └── quick_validate.py
 ```
 
 Не публикуемые локальные файлы:
