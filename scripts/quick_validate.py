@@ -8,6 +8,8 @@ import pathlib
 import subprocess
 import sys
 
+from installation_integrity import installation_identity
+
 
 def check(condition: bool, label: str, failures: list[str]) -> None:
     print(f"{'PASS' if condition else 'FAIL'} {label}")
@@ -22,7 +24,11 @@ def main() -> int:
     root = pathlib.Path(args.skill_dir).expanduser().resolve()
     failures: list[str] = []
     script = root / "scripts" / "bitrix24_session_client.py"
-    for relative in ("SKILL.md", "README.md", "scripts/bitrix24_session_client.py"):
+    for relative in (
+        "VERSION", "SKILL.md", "README.md", "install.py",
+        "scripts/bitrix24_session_client.py", "scripts/installation_integrity.py",
+        "scripts/verify_release.py",
+    ):
         check((root / relative).is_file(), f"file:{relative}", failures)
     help_result = subprocess.run([sys.executable, str(script), "--help"], text=True, capture_output=True)
     check(help_result.returncode == 0 and "collect-project-folder" in help_result.stdout, "bridge_help", failures)
@@ -31,9 +37,25 @@ def main() -> int:
         contract = json.loads(contract_result.stdout)
     except json.JSONDecodeError:
         contract = {}
-    check(contract_result.returncode == 0 and contract.get("read_only") is True, "read_only_contract", failures)
-    required = {"field_schema_export", "reference_display_value_resolution", "project_folder_inventory"}
+    check(
+        contract_result.returncode == 0
+        and contract.get("contract_version") == "1.2"
+        and contract.get("read_only") is True,
+        "read_only_contract_v1.2",
+        failures,
+    )
+    required = {
+        "field_schema_export",
+        "reference_display_value_resolution",
+        "project_folder_inventory",
+        "exact_contact_related_list_collection",
+    }
     check(required <= set(contract.get("capabilities", [])), "contract_capabilities", failures)
+    identity = installation_identity(root)
+    check(identity["location_status"] != "STALE_SKILL_COPY", f"location:{identity['location_status']}", failures)
+    if identity["location_status"] == "ACTIVE_INSTALL":
+        check(identity["status"] == "PASS", "trusted_active_install", failures)
+        check(not identity["discoverable_duplicates"], "single_discoverable_skill_copy", failures)
     return 0 if not failures else 2
 
 

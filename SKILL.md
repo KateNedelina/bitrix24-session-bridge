@@ -36,6 +36,16 @@ The script auto-loads these variables from:
 
 `${CODEX_HOME:-$HOME/.codex}/skills/bitrix24-session-bridge/.env`
 
+## Установка и обновление
+
+Устанавливай мост только из опубликованного GitHub Release. Из корня распакованного
+архива запусти `python install.py`; для существующей установки —
+`python install.py --upgrade`. Обновление атомарно сохраняет локальный `.env`,
+проверяет контракт и при любой обязательной ошибке возвращает прежнюю активную
+копию. После обновления отдельно выполни команду `contract`: Controller совместим
+только с контрактом `1.2` и capability
+`exact_contact_related_list_collection`.
+
 ## Главный сценарий: собрать всё по компании
 
 Когда пользователь просит собрать контекст по компании из CRM, используй этот skill как основной инструмент.
@@ -241,6 +251,23 @@ entity type и ID из переданного URL. Она предназначе
 зарегистрированные поля, которые раскрыла карточка, в том числе пустые; для
 стандартных полей сохраняются стабильные code/title/type metadata. Бизнес-правила
 остаются у потребителя.
+
+Собрать полный связанный список одного типа из точной карточки контакта:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/bitrix24-session-bridge/scripts/bitrix24_session_client.py" \
+  collect-contact-related-list \
+  --contact-url 'https://crm.example/crm/contact/details/200/' \
+  --related-entity-type-id 130 \
+  --output-dir '<run>/crm-performer-role-history'
+```
+
+Команда выбирает вкладку только по точной тройке `entityTypeId`,
+`parentEntityTypeId=3`, `parentEntityId=<ID контакта>`, подтверждает общее число
+строк через штатный read-only count endpoint и собирает точную карточку каждого
+связанного элемента. В `metadata/related_items.json` сохраняются исходные поля,
+полнота и идентичность контакта. Мост не решает, является ли запись прежним
+привлечением, и не сопоставляет названия ролей со ставками: это правило Контролера.
 
 Собрать полный инвентарь одной точной папки проекта Bitrix Disk:
 

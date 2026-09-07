@@ -100,6 +100,65 @@ class ReferenceRendererClient:
         return target, json.dumps({"FIELD": {"UF_REFERENCE": {"HTML": '<span data-id="7">Visible value</span>'}}})
 
 
+CONTACT_WITH_ROLES_HTML = """
+<script>
+window.card = { entityTypeId: 3, data: {"ID":"42","LAST_NAME":"Тест","NAME":"Иван"} };
+tabs: [{'id':'tab_relation_dynamic_130','name':'Роли','loader':{
+  'serviceUrl':'/lazy?entityTypeId=130&parentEntityTypeId=3&parentEntityId=42&site=s1',
+  'componentData':{'template':'','signedParameters':'signed'}}}], containerId: 'contact-tabs'
+</script>
+"""
+
+RELATED_ROLES_HTML = """
+<table><thead><tr>
+  <th data-name="TITLE"><span class="main-grid-head-title">Название</span></th>
+  <th data-name="UF_CRM_1_PROJECT_NUMBER"><span class="main-grid-head-title">Номер проекта</span></th>
+</tr></thead><tbody>
+  <tr class="main-grid-row main-grid-row-body" data-id="10"><td></td><td></td><td>Историческая роль</td><td>1111</td></tr>
+  <tr class="main-grid-row main-grid-row-body" data-id="11"><td></td><td></td><td>Текущая роль</td><td>2222</td></tr>
+</tbody></table>
+<script>Extension.getCountRow("grid", "/bitrix/services/main/ajax.php?action=getTotalCount&amp;entityTypeId=130&amp;listFilter%5B%40ID%5D%5B10%5D=10&amp;listFilter%5B%40ID%5D%5B11%5D=11")</script>
+"""
+
+
+class ContactRelatedListClient(FakeClient):
+    def fetch(self, target):
+        value = str(target)
+        if "getTotalCount" in value:
+            return value, json.dumps({"DATA": {"TEXT": "Всего: 2"}})
+        match = bridge.re.search(r"/crm/type/130/details/(10|11)/", value)
+        if match:
+            item_id = match.group(1)
+            title = "Историческая роль" if item_id == "10" else "Текущая роль"
+            project = "1111" if item_id == "10" else "2222"
+            matched_at = "01.01.2030 10:00:00" if item_id == "10" else "02.02.2030 10:00:00"
+            return value, (
+                '<script>window.card = { entityTypeId: 130, data: '
+                + json.dumps({
+                    "ID": item_id,
+                    "TITLE": title,
+                    "UF_CRM_1_PROJECT_NUMBER": project,
+                    "UF_CRM_1_LAST_DATE_MATCH": matched_at,
+                }, ensure_ascii=False)
+                + ' };</script>'
+            )
+        if "/crm/contact/details/42/" in value:
+            return value, CONTACT_WITH_ROLES_HTML
+        raise AssertionError(f"unexpected fetch: {value}")
+
+    def post_form(self, target, fields):
+        self.post_target = target
+        self.post_fields = fields
+        return self.base_url + "/lazy?entityTypeId=130", RELATED_ROLES_HTML
+
+
+class IncompleteContactRelatedListClient(ContactRelatedListClient):
+    def fetch(self, target):
+        if "getTotalCount" in str(target):
+            return str(target), json.dumps({"DATA": {"TEXT": "Всего: 3"}})
+        return super().fetch(target)
+
+
 class CollectDealContextTests(unittest.TestCase):
     def test_direct_deal_id_writes_machine_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -183,6 +242,47 @@ class CollectDealContextTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(client.login_calls, 1)
 
+    def test_exact_contact_related_list_proves_completeness_and_collects_each_item(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code = bridge.command_collect_contact_related_list(
+                ContactRelatedListClient(),
+                temp_dir,
+                "https://crm.example.test/crm/contact/details/42/",
+                "130",
+                20,
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(
+                (pathlib.Path(temp_dir) / "metadata" / "related_items.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["status"], "PASS")
+            self.assertTrue(payload["coverage"]["complete"])
+            self.assertEqual(payload["coverage"]["total_count"], 2)
+            self.assertEqual(payload["coverage"]["relation_ids"], ["10", "11"])
+            titles = {
+                field["normalized_value"]
+                for item in payload["items"]
+                for field in item["fields"]
+                if field["field_code"] == "TITLE"
+            }
+            self.assertEqual(titles, {"Историческая роль", "Текущая роль"})
+
+    def test_related_list_blocks_when_count_and_relation_ids_disagree(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code = bridge.command_collect_contact_related_list(
+                IncompleteContactRelatedListClient(),
+                temp_dir,
+                "https://crm.example.test/crm/contact/details/42/",
+                "130",
+                20,
+            )
+            self.assertEqual(code, 2)
+            payload = json.loads(
+                (pathlib.Path(temp_dir) / "metadata" / "related_items.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(payload["coverage"]["complete"])
+            self.assertIn("CONTACT_RELATED_LIST_RELATION_IDS_INCOMPLETE", payload["errors"])
+
     def test_project_folder_inventory_recurses_and_hashes_only_requested_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = "https://crm.example.test/docs/shared/path/root/"
@@ -239,6 +339,7 @@ class CollectDealContextTests(unittest.TestCase):
             "build-company-dossier",
             "collect-deal-context",
             "collect-entity-context",
+            "collect-contact-related-list",
             "collect-project-folder",
             "contract",
         ):
