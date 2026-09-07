@@ -55,13 +55,28 @@ MIME/расширения, URL, время чтения и SHA-256 только 
 
 ## Быстрый старт
 
-1. Скопируйте пример окружения:
+1. Скачайте архив последнего GitHub Release и из его корня выполните:
+
+```bash
+python install.py
+```
+
+Для обновления существующей установки:
+
+```bash
+python install.py --upgrade
+```
+
+На Windows можно использовать `py` вместо `python`. Обновление сохраняет локальный
+`.env`, проверяет контракт и автоматически откатывается при ошибке.
+
+2. Перейдите в установленный каталог и скопируйте пример окружения:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Заполните `.env` локальными доступами к Bitrix24:
+3. Заполните `.env` локальными доступами к Bitrix24:
 
 ```dotenv
 B24_BASE_URL=https://your-bitrix24.example.com
@@ -69,7 +84,11 @@ B24_LOGIN=your.login@example.com
 B24_PASSWORD=your-password
 ```
 
-3. Проверьте вход и базовые разделы:
+4. Проверьте машинный контракт, затем вход и базовые разделы:
+
+```bash
+python scripts/bitrix24_session_client.py contract
+```
 
 ```bash
 python3 scripts/bitrix24_session_client.py probe
@@ -82,7 +101,7 @@ python3 scripts/bitrix24_session_client.py probe
 python3 scripts/quick_validate.py --skill-dir .
 ```
 
-4. Соберите dossier по компании:
+5. Соберите dossier по компании:
 
 ```bash
 python3 scripts/bitrix24_session_client.py build-company-dossier \
@@ -90,7 +109,7 @@ python3 scripts/bitrix24_session_client.py build-company-dossier \
   --mode full
 ```
 
-5. Проверьте результат:
+6. Проверьте результат:
 
 ```bash
 cat bitrix24_company_contexts/<company-slug>/metadata/run_report.json

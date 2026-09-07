@@ -1,0 +1,22 @@
+name: Release validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate bridge package
+        run: python scripts/verify_release.py --skill-dir . --output bridge-release-validation.json
+      - name: Validate installer and upgrade
+        run: python -m unittest discover -s tests -p "test_*.py" -v

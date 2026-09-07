@@ -34,7 +34,7 @@ from typing import Iterable
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parents[1]
 ENV_PATH = SKILL_DIR / ".env"
-BRIDGE_VERSION = "0.3.1-candidate"
+BRIDGE_VERSION = "0.3.1"
 BRIDGE_CONTRACT_VERSION = "1.2"
 BRIDGE_CAPABILITIES = (
     "deal_outer_and_side_slider_fetch",
