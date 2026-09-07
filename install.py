@@ -30,6 +30,14 @@ INSTALL_MARKER = ".bitrix24-session-bridge-release.json"
 VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
 
 
+def configure_utf8_console() -> None:
+    """Keep Russian diagnostics printable on Windows consoles with legacy encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def release_version() -> str:
     value = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if not VERSION_PATTERN.fullmatch(value):
@@ -126,6 +134,7 @@ def verify_active(target: Path, report: Path) -> None:
 
 
 def main() -> int:
+    configure_utf8_console()
     parser = argparse.ArgumentParser(description="Установить bitrix24-session-bridge")
     parser.add_argument("--upgrade", action="store_true", help="атомарно заменить установленную версию, сохранив .env")
     args = parser.parse_args()
