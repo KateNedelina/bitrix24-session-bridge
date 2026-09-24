@@ -159,7 +159,81 @@ class IncompleteContactRelatedListClient(ContactRelatedListClient):
         return super().fetch(target)
 
 
+class ProjectSearchClient(FakeClient):
+    def __init__(self):
+        self.targets = []
+
+    def fetch(self, target):
+        self.targets.append(str(target))
+        if str(target).startswith("/crm/deal/list/"):
+            return self.base_url + str(target), (
+                '<table><tr class="main-grid-row main-grid-row-body" data-id="555">'
+                '<td><a href="/crm/deal/details/555/">4695: Synthetic project</a></td>'
+                '</tr></table>'
+            )
+        return super().fetch(target)
+
+
+DEAL_WITH_ROLES_HTML = """
+<script>
+window.card = { entityTypeId: 2, data: {"ID":"555","TITLE":"4695: Synthetic project"} };
+tabs: [{'id':'tab_relation_dynamic_130','name':'Роли','loader':{
+  'serviceUrl':'/lazy?entityTypeId=130&parentEntityTypeId=2&parentEntityId=555&site=s1',
+  'componentData':{'template':'','signedParameters':'signed'}}}], containerId: 'deal-tabs'
+</script>
+"""
+
+ONE_RELATED_ROLE_HTML = """
+<table><thead><tr>
+  <th data-name="TITLE"><span class="main-grid-head-title">Название</span></th>
+</tr></thead><tbody>
+  <tr class="main-grid-row main-grid-row-body" data-id="11"><td></td><td></td><td>Текущая роль</td></tr>
+</tbody></table>
+<script>Extension.getCountRow("grid", "/bitrix/services/main/ajax.php?action=getTotalCount&amp;entityTypeId=130&amp;listFilter%5B%40ID%5D%5B11%5D=11")</script>
+"""
+
+
+class DealRelatedListClient(FakeClient):
+    def fetch(self, target):
+        value = str(target)
+        if "getTotalCount" in value:
+            return value, json.dumps({"DATA": {"TEXT": "Всего: 1"}})
+        if "/crm/type/130/details/11/" in value:
+            return value, (
+                '<script>window.card = { entityTypeId: 130, data: '
+                + json.dumps({
+                    "ID": "11",
+                    "TITLE": "Текущая роль",
+                    "PARENT_ID_2": "555",
+                    "CONTACT_ID": "200",
+                }, ensure_ascii=False)
+                + ' };</script>'
+            )
+        if "/crm/deal/details/555/" in value:
+            return value, DEAL_WITH_ROLES_HTML
+        raise AssertionError(f"unexpected fetch: {value}")
+
+    def post_form(self, target, fields):
+        self.post_target = target
+        self.post_fields = fields
+        return self.base_url + "/lazy?entityTypeId=130", ONE_RELATED_ROLE_HTML
+
+
 class CollectDealContextTests(unittest.TestCase):
+    def test_project_number_search_applies_filter_and_selects_exact_prefix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ProjectSearchClient()
+            code = bridge.command_collect_deal_context(
+                client, temp_dir, "4695", None, None, True
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(any("FIND=4695" in target and "apply_filter=Y" in target
+                                for target in client.targets))
+            report = json.loads(
+                (pathlib.Path(temp_dir) / "metadata" / "run_report.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["selected_deal"]["deal_id"], "555")
+
     def test_direct_deal_id_writes_machine_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             code = bridge.command_collect_deal_context(
@@ -283,6 +357,41 @@ class CollectDealContextTests(unittest.TestCase):
             self.assertFalse(payload["coverage"]["complete"])
             self.assertIn("CONTACT_RELATED_LIST_RELATION_IDS_INCOMPLETE", payload["errors"])
 
+    def test_exact_deal_related_list_collects_the_current_role(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code = bridge.command_collect_deal_related_list(
+                DealRelatedListClient(),
+                temp_dir,
+                "https://crm.example.test/crm/deal/details/555/",
+                "130",
+                20,
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(
+                (pathlib.Path(temp_dir) / "metadata" / "related_items.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["status"], "PASS")
+            self.assertEqual(payload["deal"]["entity_id"], "555")
+            self.assertEqual(payload["coverage"]["relation_ids"], ["11"])
+            role_fields = payload["items"][0]["fields"]
+            performer = next(item for item in role_fields if item["field_code"] == "CONTACT_ID")
+            self.assertEqual(performer["normalized_value"], "200")
+
+    def test_deal_related_list_accepts_an_already_open_side_slider_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code = bridge.command_collect_deal_related_list(
+                DealRelatedListClient(),
+                temp_dir,
+                "https://crm.example.test/crm/deal/details/555/?IFRAME=Y&IFRAME_TYPE=SIDE_SLIDER",
+                "130",
+                20,
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(
+                (pathlib.Path(temp_dir) / "metadata" / "related_items.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["coverage"]["relation_ids"], ["11"])
+
     def test_project_folder_inventory_recurses_and_hashes_only_requested_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = "https://crm.example.test/docs/shared/path/root/"
@@ -340,6 +449,7 @@ class CollectDealContextTests(unittest.TestCase):
             "collect-deal-context",
             "collect-entity-context",
             "collect-contact-related-list",
+            "collect-deal-related-list",
             "collect-project-folder",
             "contract",
         ):

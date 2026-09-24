@@ -49,6 +49,7 @@ def main() -> int:
         "reference_display_value_resolution",
         "project_folder_inventory",
         "exact_contact_related_list_collection",
+        "exact_deal_related_list_collection",
     }
     check(required <= set(contract.get("capabilities", [])), "contract_capabilities", failures)
     identity = installation_identity(root)

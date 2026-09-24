@@ -182,6 +182,15 @@ python3 scripts/bitrix24_session_client.py collect-contact-related-list \
   --output-dir ./contact-related-list
 ```
 
+Собрать роли точной сделки:
+
+```bash
+python3 scripts/bitrix24_session_client.py collect-deal-related-list \
+  --deal-url 'https://crm.example/crm/deal/details/123/' \
+  --related-entity-type-id 130 \
+  --output-dir ./deal-related-list
+```
+
 Собрать контекст по названию компании:
 
 ```bash
