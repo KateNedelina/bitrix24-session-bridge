@@ -54,7 +54,7 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(env_path.read_bytes()).hexdigest(), before)
             marker = json.loads((target / ".bitrix24-session-bridge-release.json").read_text(encoding="utf-8"))
             report = json.loads((home / "bitrix24-session-bridge-installation-validation.json").read_text(encoding="utf-8"))
-            self.assertEqual(marker["version"], "0.3.1")
+            self.assertEqual(marker["version"], "0.3.2")
             self.assertEqual(report["status"], "PASS")
             self.assertTrue(report["installation"]["env_preserved"])
 

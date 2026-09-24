@@ -43,8 +43,9 @@ The script auto-loads these variables from:
 `python install.py --upgrade`. Обновление атомарно сохраняет локальный `.env`,
 проверяет контракт и при любой обязательной ошибке возвращает прежнюю активную
 копию. После обновления отдельно выполни команду `contract`: Controller совместим
-только с контрактом `1.2` и capability
-`exact_contact_related_list_collection`.
+только с контрактом `1.2` и capabilities
+`exact_contact_related_list_collection`,
+`exact_deal_related_list_collection`.
 
 ## Главный сценарий: собрать всё по компании
 
@@ -210,7 +211,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/bitrix24-session-bridge/scripts/bitr
   --output '<run>/crm-dossier/metadata/deal-project-search.json'
 ```
 
-Команда выполняет только штатный поиск раздела «Сделки» (`FIND=4623`) и принимает
+Команда выполняет только штатный поиск раздела «Сделки» (`FIND=4623&apply_filter=Y`) и принимает
 лишь единственную строку с заголовком `4623: …`. При нуле или нескольких строках
 она сохраняет безопасный отчёт и завершается с блокером; глобальный поиск
 Мессенджера использовать нельзя.
@@ -268,6 +269,21 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/bitrix24-session-bridge/scripts/bitr
 связанного элемента. В `metadata/related_items.json` сохраняются исходные поля,
 полнота и идентичность контакта. Мост не решает, является ли запись прежним
 привлечением, и не сопоставляет названия ролей со ставками: это правило Контролера.
+
+Собрать полный список ролей точной сделки:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/bitrix24-session-bridge/scripts/bitrix24_session_client.py" \
+  collect-deal-related-list \
+  --deal-url 'https://crm.example/crm/deal/details/123/' \
+  --related-entity-type-id 130 \
+  --output-dir '<run>/crm-deal-role-list'
+```
+
+Команда применяет тот же точный read-only контур к тройке
+`entityTypeId=130`, `parentEntityTypeId=2`, `parentEntityId=<ID сделки>`.
+Если сделка уже представлена side-slider URL, мост читает фактически
+сохранённый HTML карточки и не теряет вкладку «Роли».
 
 Собрать полный инвентарь одной точной папки проекта Bitrix Disk:
 

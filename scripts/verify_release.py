@@ -14,9 +14,12 @@ import sys
 from installation_integrity import INSTALL_MARKER, installation_identity, install_marker_errors
 
 
-EXPECTED_VERSION = "0.3.1"
+EXPECTED_VERSION = "0.3.2"
 EXPECTED_CONTRACT = "1.2"
-EXPECTED_CAPABILITY = "exact_contact_related_list_collection"
+EXPECTED_CAPABILITIES = {
+    "exact_contact_related_list_collection",
+    "exact_deal_related_list_collection",
+}
 
 
 def run(command: list[str], cwd: Path) -> tuple[bool, str]:
@@ -72,7 +75,7 @@ def main() -> int:
         ok
         and contract.get("contract_version") == EXPECTED_CONTRACT
         and contract.get("read_only") is True
-        and EXPECTED_CAPABILITY in contract.get("capabilities", [])
+        and EXPECTED_CAPABILITIES <= set(contract.get("capabilities", []))
     )
     check("controller_contract", contract_ok, detail or "Контракт не получен")
 

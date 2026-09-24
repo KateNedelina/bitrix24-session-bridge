@@ -102,9 +102,9 @@ class FakeDealSearchClient:
         return "https://crm.prof-4.ru/stream/"
 
     def fetch(self, target):
-        if str(target) != "/crm/deal/list/?FIND=4623":
+        if str(target) != "/crm/deal/list/?FIND=4623&apply_filter=Y":
             raise AssertionError(f"unexpected deal-search path: {target}")
-        return "https://crm.prof-4.ru/crm/deal/list/?FIND=4623", DEAL_SEARCH_HTML
+        return "https://crm.prof-4.ru/crm/deal/list/?FIND=4623&apply_filter=Y", DEAL_SEARCH_HTML
 
 
 class FakeFallbackClient:
@@ -446,7 +446,7 @@ class IncomeContractListTests(unittest.TestCase):
             output = Path(tmp) / "deal-project-search.json"
             client = FakeDealSearchClient()
             with patch.object(client, "fetch", return_value=(
-                "https://crm.prof-4.ru/crm/deal/list/?FIND=4623",
+                "https://crm.prof-4.ru/crm/deal/list/?FIND=4623&apply_filter=Y",
                 DEAL_SEARCH_HTML_WITH_REORDERED_CLASSES,
             )), redirect_stdout(StringIO()):
                 result = command_find_deal_by_project_number(client, "4623", str(output))
